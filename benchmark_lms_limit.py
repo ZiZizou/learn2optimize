@@ -8,43 +8,39 @@ import pandas as pd
 from config import *
 
 # ==========================================
-# 1. Channel Generation (Identical to l2o_basic.py)
+# 1. Channel Generation (Diagnostic Mode - No Reflections)
 # ==========================================
 class WirelineChannelGenerator:
     def __init__(self, num_taps=50, snr_range=(15, 25)):
         """
-        Generates channels with lengths of 20-50 taps 
+        Generates channels with lengths of 20-50 taps
         and AWGN with SNR of 15-25 dB[cite: 55].
         """
         self.num_taps = num_taps
         self.snr_range = snr_range
 
     def generate_batch(self, batch_size):
-        # Alternative to Rayleigh fading: Simulate wireline low-pass RC/RLC step responses
-        # Here we use a simplified proxy: exponential decay + random reflections
-        # 5 seconds duration, with num_taps samples
+        # Alternative to Rayleigh fading[cite: 54]: Simulate wireline low-pass RC/RLC step responses
+        # Here we use a simplified proxy: exponential decay (NO random reflections for diagnostic)
         t = torch.linspace(0, 5, self.num_taps)
-        
+
         channels = []
         for _ in range(batch_size):
-            # This line samples a single scalar random float drawn uniformly from the interval 
-            # [0.5 ,1.5) and stores it in the Python variable tau. The result is a plain Python float, not a PyTorch tensor.
-            tau = torch.empty(1).uniform_(0.5, 1.5).item() 
+            tau = torch.empty(1).uniform_(0.5, 1.5).item()
             # Main cursor + post-cursor tail (skin-effect proxy)
             # Standard RC low-pass proxy: instantaneous rise, exponential decay
             # Peak (main cursor) is strictly at index 0
-            # previously was - h = torch.exp(-t / tau) * torch.sin(t + 1e-3) [but this introduced non-causal pre-cursor]
-            h = torch.exp(-t / tau) 
-            
-            # Add discrete reflections (via/connector proxy)
-            num_reflections = torch.randint(1, 4, (1,)).item()
-            for _ in range(num_reflections):
-                idx = torch.randint(5, self.num_taps, (1,)).item()
-                h[idx] += torch.empty(1).uniform_(-0.2, 0.2).item()
-                
+            h = torch.exp(-t / tau)
+
+            # DIAGNOSTIC MODE: Disable random reflections for clean exponential tail
+            # num_reflections = torch.randint(1, 4, (1,)).item()
+            # for _ in range(num_reflections):
+            #     idx = torch.randint(5, self.num_taps, (1,)).item()
+            #     h[idx] += torch.empty(1).uniform_(-0.2, 0.2).item()
+
             h = h / torch.norm(h) # Normalize energy
             channels.append(h)
-            
+
         return torch.stack(channels)
 
     def generate_received_signal(self, tx_symbols, batch_size):
@@ -135,8 +131,7 @@ class DifferentiableCTLE(nn.Module):
 # ==========================================
 # 3. NLMS Algorithm with 1-Tap FFE
 # ==========================================
-def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forcing=True,
-                 use_gear_shift=False, mu_fast=0.2, mu_slow=0.01, gear_threshold=0.5, ema_alpha=0.05):
+def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forcing=True):
     """
     NLMS DFE with integrated 1-tap FFE (Variable Gain Amplifier).
 
@@ -144,27 +139,12 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
     target +/-1 symbol alphabet before DFE subtraction.
 
     Forward: y_t = w_main * rx_signal[t] - w_fb^T * d_fb
-
-    Parameters:
-        mu: Static step size (used when use_gear_shift=False)
-        use_gear_shift: If True, enable variable step-size (gear-shifting)
-        mu_fast: Acquisition gear step size (default: 0.2)
-        mu_slow: Tracking gear step size (default: 0.01)
-        gear_threshold: MSE threshold to trigger gear shift (default: 0.5)
-        ema_alpha: Smoothing factor for error variance (default: 0.05)
     """
     seq_len = rx_signal.shape[0]
     weights = torch.zeros(num_taps, dtype=torch.float32)
     w_main = torch.tensor(FFE_INIT, dtype=torch.float32)  # 1-tap FFE/VGA
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
     mse_log = []
-
-    # Step size selection: static or gear-shifting
-    if use_gear_shift:
-        current_mu = mu_fast  # Start with fast acquisition
-        ema_error_sq = 1.0    # Start high to prevent premature shifting
-    else:
-        current_mu = mu        # Use static mu
 
     for t in range(seq_len):
         # Forward pass: w_main * x_t - w_fb^T * d_fb
@@ -174,25 +154,15 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
         e_t = tx_symbols[t] - eq_out
         mse_log.append((e_t.item())**2)
 
-        # Gear-shifting: Update EMA of squared error
-        if use_gear_shift:
-            ema_error_sq = (1 - ema_alpha) * ema_error_sq + ema_alpha * (e_t.item() ** 2)
-
-            # Gear-shifting logic
-            if ema_error_sq < gear_threshold:
-                current_mu = mu_slow
-            else:
-                current_mu = mu_fast
-
         # Normalization includes both the main tap input and feedback buffer
         norm_sq = (rx_signal[t] ** 2) + torch.dot(decision_buffer, decision_buffer) + eps
 
-        # Update feedback weights using current_mu
-        update_step = (current_mu * e_t * decision_buffer) / norm_sq
+        # Update feedback weights
+        update_step = (mu * e_t * decision_buffer) / norm_sq
         weights = weights - update_step
 
-        # Update main tap (1-tap FFE) using current_mu
-        update_main = (current_mu * e_t * rx_signal[t]) / norm_sq
+        # Update main tap (1-tap FFE)
+        update_main = (mu * e_t * rx_signal[t]) / norm_sq
         w_main = w_main + update_main
 
         decision_buffer = torch.roll(decision_buffer, shifts=1)
@@ -203,78 +173,6 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
 
     return torch.tensor(mse_log), weights, w_main
 
-
-# ==========================================
-# RLS Implementation Explanation
-#   1. Initialization (Setting the Stage)
-#   Code: Lines 153–155
-
-
-#    1 # Initialize weights w_0 = 0, but force first element (main tap) to 1.0
-#    2 weights = torch.zeros(system_order, dtype=torch.float32)
-#    3 weights[0] = 1.0  # Main tap initialized to 1.0
-#    4
-#    5 # Initialize inverse correlation matrix P_0 = delta^(-1) * I
-#    6 P = torch.eye(system_order, dtype=torch.float32) / delta
-#    * Intuition: We start with a "best guess" for weights.
-#    * The Matrix $P$: This is the most important part of RLS. It represents our uncertainty. We initialize it with large values (via 1/delta), telling the    
-#      algorithm: "I don't know anything yet, so be ready to make big changes."
-
-#   ---
-
-
-#   2. Constructing the Input ($u_t$)
-#   Code: Line 166
-#    1 u_t = torch.cat([rx_signal[t:t+1], -decision_buffer]).unsqueeze(1)
-#    * Intuition: We bundle everything the equalizer needs to look at into one vector: the current noisy signal ($x_t$) and the previous "decisions" (the      
-#      feedback).
-#    * Note: The feedback is negated here so that the math naturally performs subtraction (Equalizer = Gain × Signal - Feedback).
-
-#   ---
-
-#   3. Filtering & Error Calculation
-#   Code: Lines 170–173
-
-
-#    1 eq_out = torch.dot(weights, u_t.squeeze())
-#    2 e_t = tx_symbols[t] - eq_out
-#    * Intuition: We multiply our current weights by the input to get an estimate of the symbol. The error ($e_t$) is simply the difference between what we    
-#      wanted to see (the true symbol) and what the filter actually produced.
-
-#   ---
-
-#   4. Calculating the Gain ($k_t$)
-#   Code: Lines 176–181
-
-
-#    1 P_u = torch.matmul(P, u_t)
-#    2 u_P_u = torch.matmul(u_t.t(), P_u)
-#    3 denom = lam + u_P_u.squeeze()
-#    4 k_t = P_u / denom
-#    * Intuition: This is the "Kalman Gain." Think of it as a sophisticated step-size. Unlike LMS (which uses a fixed $\mu$), RLS looks at the matrix $P$ to
-#      decide exactly how much to trust this specific piece of new data. If the input is in a direction we are already sure about, the gain is small. If it's
-#      something new, the gain is large.
-
-#   ---
-
-
-#   5. Updating the Weights
-#   Code: Line 184
-#    1 weights = weights + (k_t.squeeze() * e_t)
-#    * Intuition: We nudge the weights in the direction that reduces the error. Because we use the Gain ($k_t$) instead of a simple constant, the weights jump 
-#      to the optimal values much faster than they would in standard NLMS.
-
-#   ---
-
-
-#   6. Updating the Inverse Matrix ($P$)
-#   Code: Lines 189–190
-#    1 k_u_t = torch.matmul(k_t, u_t.t())
-#    2 P = (P - torch.matmul(k_u_t, P)) / lam
-#    * Intuition: This is the "learning" step for the algorithm's internal model. We update $P$ to reflect that we now have more information about the signal.
-#    * The Forgetting Factor ($\lambda$): We divide by lam (usually 0.99). This tells the algorithm to "slowly forget" very old data, allowing it to adapt if
-#      the cable properties change over time.
-# ==========================================
 
 # ==========================================
 # 3b. RLS Algorithm with 1-Tap FFE
@@ -357,28 +255,39 @@ def cross_correlate_sync(tx, rx, max_delay=100):
     # Use the first 500 symbols for robust synchronization
     tx_sync = tx[:500]
     rx_sync = rx[:1000]
-    
+
     corrs = []
     for d in range(max_delay):
         # Compute correlation at delay d
         c = torch.dot(tx_sync, rx_sync[d:d+500])
         corrs.append(c.item())
-        
+
     return torch.argmax(torch.abs(torch.tensor(corrs))).item()
 
 # ==========================================
 # 5. Benchmark Execution
 # ==========================================
 if __name__ == "__main__":
-    # --- CONFIGURATION (from config.py) ---
-    # See config.py for all common settings
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+
+    # --- CONFIGURATION (DIAGNOSTIC MODE) ---
+    # Match DFE taps to channel length (50 taps = 1 main + 49 post-cursors)
+    CH_TAPS = 50
+    DFE_TAPS = 49  # Match channel length for full ISI cancellation
+    CTLE_TAPS = 15
+
+    SNR_RANGE = (15, 25)  # dB
+    SEQ_LENGTH = 10000
+    FIXED_PEAKING = 0.5  # Initial/Fixed CTLE gain
     # --------------------------------------------------
-    
-    print(f"Initializing Benchmark...")
+
+    print(f"Initializing Diagnostic Benchmark...")
     print(f"Channel Taps: {CH_TAPS}")
-    print(f"DFE Taps: {DFE_TAPS}")
+    print(f"DFE Taps: {DFE_TAPS} (matching channel for full ISI cancellation)")
     print(f"CTLE Taps: {CTLE_TAPS} (Fixed Peaking: {FIXED_PEAKING})")
     print(f"SNR Range: {SNR_RANGE} dB")
+    print(f"Reflections: DISABLED (diagnostic mode)")
     print("-" * 30)
 
     # 1. Generate test data (Retain ground-truth channel h)
@@ -400,7 +309,7 @@ if __name__ == "__main__":
     # Align rx and tx (use [cursor_delay:] for both to avoid -0 bug)
     rx_aligned = rx_ctle[cursor_delay:]
     tx_aligned = tx[cursor_delay:]
-    
+
     print(f"Aligned sequence length: {len(tx_aligned)}")
     print("-" * 30)
 
@@ -409,68 +318,31 @@ if __name__ == "__main__":
     plt.figure(figsize=(10, 6))
 
     # Define burn-in period to ignore initial convergence outliers
-    print(f"Acquisition vs Steady-State Performance:")
-    print(f"{'Method':<25} | {'MSE @ 500':<12} | {'Steady-State':<15} | {'Final w_main'}")
-    print("-" * 75)
+    print(f"Steady-State Performance (Averaged from symbol {BURN_IN} to end):")
+    print("-" * 60)
 
     for mu_val in mu_values:
         mse_history, final_w, w_main = run_nlms_dfe(rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=mu_val, teacher_forcing=True)
         
-        # 1. Acquisition MSE (Average of symbols 0-500)
-        acq_mse = torch.mean(mse_history[:500]).item()
-        acq_mse_db = 10 * torch.log10(torch.tensor(acq_mse)).item()
-
-        # 2. Steady-State MSE (Average of symbols BURN_IN to end)
+        # Calculate steady-state MSE
         ss_mse = torch.mean(mse_history[BURN_IN:]).item()
         ss_mse_db = 10 * torch.log10(torch.tensor(ss_mse)).item()
-        
-        method_name = f"NLMS (mu={mu_val})"
-        print(f"{method_name:<25} | {acq_mse_db:>7.2f} dB | {ss_mse_db:>10.2f} dB | {w_main.item():.3f}")
+        print(f"NLMS (mu={mu_val:<4}): Avg MSE = {ss_mse:.6f} ({ss_mse_db:.2f} dB) | Final w_main={w_main.item():.3f}")
 
         smoothed_mse = pd.Series(mse_history.numpy()).ewm(span=200).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_mse)), label=f'NLMS (mu={mu_val}, w_main={w_main.item():.3f})')
 
-    # 4b. Run Gear-Shifting NLMS (Variable Step-Size)
-    mse_history_gs, final_w_gs, w_main_gs = run_nlms_dfe(
-        rx_aligned, tx_aligned, num_taps=DFE_TAPS,
-        mu=0.1,  # Base mu (used when use_gear_shift=False)
-        teacher_forcing=True,
-        use_gear_shift=True,  # Enable gear-shifting
-        mu_fast=GEAR_SHIFT_MU_FAST,
-        mu_slow=GEAR_SHIFT_MU_SLOW,
-        gear_threshold=GEAR_SHIFT_THRESHOLD,
-        ema_alpha=GEAR_SHIFT_EMA_ALPHA
-    )
-
-    # Acquisition vs Steady-State for Gear-Shift
-    acq_mse_gs = torch.mean(mse_history_gs[:500]).item()
-    acq_mse_gs_db = 10 * torch.log10(torch.tensor(acq_mse_gs)).item()
-    ss_mse_gs = torch.mean(mse_history_gs[BURN_IN:]).item()
-    ss_mse_gs_db = 10 * torch.log10(torch.tensor(ss_mse_gs)).item()
-    
-    print(f"{'NLMS Gear-Shift':<25} | {acq_mse_gs_db:>7.2f} dB | {ss_mse_gs_db:>10.2f} dB | {w_main_gs.item():.3f}")
-
-    smoothed_mse_gs = pd.Series(mse_history_gs.numpy()).ewm(span=200).mean()
-    plt.plot(
-        10 * torch.log10(torch.tensor(smoothed_mse_gs)),
-        color='purple', linewidth=2,
-        label=f'NLMS Gear-Shift (mu_fast={GEAR_SHIFT_MU_FAST}, mu_slow={GEAR_SHIFT_MU_SLOW})'
-    )
-
     # 5. Run RLS DFE (optimal linear upper bound)
     mse_history_rls, final_w_rls = run_rls_dfe(
         rx_aligned, tx_aligned, num_taps=DFE_TAPS,
-        lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=True
+        lam=0.99, delta=0.01, teacher_forcing=True
     )
     
-    # Acquisition vs Steady-State for RLS
-    acq_mse_rls = torch.mean(mse_history_rls[:500]).item()
-    acq_mse_rls_db = 10 * torch.log10(torch.tensor(acq_mse_rls)).item()
+    # Calculate steady-state MSE for RLS
     ss_mse_rls = torch.mean(mse_history_rls[BURN_IN:]).item()
     ss_mse_rls_db = 10 * torch.log10(torch.tensor(ss_mse_rls)).item()
-    
-    print(f"{'RLS (lam='+str(RLS_LAMBDA)+')':<25} | {acq_mse_rls_db:>7.2f} dB | {ss_mse_rls_db:>10.2f} dB | {final_w_rls[0].item():.3f}")
-    print("-" * 75)
+    print(f"RLS (lam=0.99): Avg MSE = {ss_mse_rls:.6f} ({ss_mse_rls_db:.2f} dB) | Final w_main={final_w_rls[0].item():.3f}")
+    print("-" * 60)
 
     smoothed_mse_rls = pd.Series(mse_history_rls.numpy()).ewm(span=200).mean()
     plt.plot(
@@ -480,56 +352,9 @@ if __name__ == "__main__":
     )
 
     plt.axhline(y=-20, color='r', linestyle='--', label='Target MSE (-20 dB)')
-    plt.title(f'NLMS vs Gear-Shift vs RLS Baseline (CH={CH_TAPS}, DFE={DFE_TAPS})')
+    plt.title(f'NLMS vs RLS Baseline - Diagnostic (CH={CH_TAPS}, DFE={DFE_TAPS}, No Reflections)')
     plt.xlabel('Symbols')
     plt.ylabel('MSE (dB)')
     plt.legend()
     plt.grid(True)
     plt.show()
-
-
-# Note about the meaning of the inverse P matrix in RLS:
-# The inverse matrix $P$ is strictly about the input signal’s statistics, not the equalizer weights themselves.
-
-#   To understand $P$ intuitively, you can think of it as the "Inverse Energy Map" of your input signal. Here is the breakdown:
-
-
-#   1. Is it about the weights or the signal?
-#   It is about the input signal.
-#   Specifically, $P$ is the inverse of the Autocorrelation Matrix of your input vector $u_t$.
-#    * The weights ($w$): Represent what the filter is doing (the "solution").
-#    * The matrix ($P$): Represents how much we know about the signal environment (the "context").
-
-
-#   2. What information does it hold?
-#   $P$ tracks how every tap in your equalizer correlates with every other tap.
-#    * On the Diagonal: It tracks the inverse of the signal power at each tap. If a tap has seen very little signal energy, the value in $P$ stays high. This  
-#      tells the algorithm: "We haven't seen much data here yet, so if an error occurs, make a large change to this weight."
-#    * Off the Diagonal: It tracks the "redundancy" between taps. If Tap 1 and Tap 2 always move together (high correlation), $P$ recognizes this. It ensures  
-#      that the weight update doesn't "over-correct" both taps for the same error.
-
-#   3. Clarifying the "Memory" (The 50 vs. 100 vs. 10 confusion)
-#   There are three different "lengths" to keep track of in your code:
-
-
-#    * Filter Length (Size of $P$): In your code, DFE_TAPS = 10. Therefore, $P$ is an $11 \times 11$ matrix (10 feedback taps + 1 main tap). It only tracks the
-#      correlations between the 11 pieces of data currently sitting in your equalizer's memory. It does not care that the channel has 50 taps; it only cares   
-#      about the 11 it is trying to optimize.
-#    * Channel Memory: CH_TAPS = 50. This is the physical reality of the wire—how long the echoes last.
-#    * RLS Temporal Memory (Forgetting Factor): This is determined by lam = 0.99. The "memory" of RLS (how many previous symbols influence the current $P$) is 
-#      roughly:
-#       $$\text{Memory} \approx \frac{1}{1 - \lambda} = \frac{1}{1 - 0.99} = \mathbf{100 \text{ symbols}}$$
-#       So, $P$ is an $11 \times 11$ "map" built using the statistical history of the last 100 symbols.
-
-
-#   The "Simple" Intuition
-#   Imagine you are trying to tune a guitar with 11 strings ($11$ taps).
-#    * The Weights are the current tightness of the strings.
-#    * The Matrix $P$ is your knowledge of how sensitive each string is.
-#        * If you haven't plucked string #5 yet, your "uncertainty" ($P$) for that string is very high.
-#        * The first time you pluck it and hear a wrong note (an error), RLS will use that high $P$ value to make a huge adjustment to that string's weight.   
-#        * As you keep plucking it, $P$ gets smaller, and your adjustments become finer and more precise.
-
-
-#   In short: $P$ is the algorithm's confidence map of the input signal space. It tells the equalizer which directions are "well-explored" and which directions
-#   still need "bold" updates.

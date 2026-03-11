@@ -7,23 +7,23 @@ from config import *
 
 # CONCRETE OUTCOMES OF THIS CODE
 # 1. Baseline Verification
-# Your initial milestone requires implementing the simulation environment alongside classical baseline algorithms. 
-# Before introducing the neural network, you must have a verified, fixed-step NLMS and RLS implementation converging on 
+# Your initial milestone requires implementing the simulation environment alongside classical baseline algorithms.
+# Before introducing the neural network, you must have a verified, fixed-step NLMS and RLS implementation converging on
 # the synthetic proxy channel. This establishes the numerical upper and lower bounds for your convergence speed and steady-state MSE.
 
 # 2. Verifying Gradient Flow (The Overfit Test)
-# The primary objective of this phase is to set up the unrolled computational graph and test meta-training on a single channel 
+# The primary objective of this phase is to set up the unrolled computational graph and test meta-training on a single channel
 # to ensure gradients flow.
 
-# Because you are unrolling the DFE updates over time, the chain rule operations ∏∇w​f(wt​) expose you to exploding gradients 
+# Because you are unrolling the DFE updates over time, the chain rule operations ∏∇w​f(wt​) expose you to exploding gradients
 # in the unrolled graph. You must verify that the meta-loss derivative with respect to the optimizer network weights does not vanish to zero or explode to NaN over your chosen TBPTT horizon. If the network cannot memorize and drastically accelerate convergence on one static channel, it will fail on 5,000.
 
 # 3. Teacher Forcing Sanity Check
-# Decision-feedback instability, where error propagation creates biased gradients, is a primary risk. You must 
+# Decision-feedback instability, where error propagation creates biased gradients, is a primary risk. You must
 #implement teacher forcing by using ground-truth past symbols for the feedback filter during the unrolled meta-training. The prototype phase must prove that this mechanism mathematically stabilizes the loss landscape compared to using hard decisions during the backward pass.
 
 # 4. Parameter Projection Mechanics
-# You proposed mapping the CTLE gain G∈[0,1] via a sigmoid function to project parameters to a feasible set. You must verify that the 
+# You proposed mapping the CTLE gain G∈[0,1] via a sigmoid function to project parameters to a feasible set. You must verify that the
 # gradients pass cleanly through this projection. If the pre-activation values become too large, the sigmoid will saturate, killing the gradient and halting CTLE adaptation entirely.
 
 
@@ -33,7 +33,7 @@ from config import *
 class WirelineChannelGenerator:
     def __init__(self, num_taps=50, snr_range=(15, 25)):
         """
-        Generates channels with lengths of 20-50 taps 
+        Generates channels with lengths of 20-50 taps
         and AWGN with SNR of 15-25 dB[cite: 55].
         """
         self.num_taps = num_taps
@@ -43,24 +43,24 @@ class WirelineChannelGenerator:
         # Alternative to Rayleigh fading[cite: 54]: Simulate wireline low-pass RC/RLC step responses
         # Here we use a simplified proxy: exponential decay + random reflections
         t = torch.linspace(0, 5, self.num_taps)
-        
+
         channels = []
         for _ in range(batch_size):
-            tau = torch.empty(1).uniform_(0.5, 1.5).item() 
+            tau = torch.empty(1).uniform_(0.5, 1.5).item()
             # Main cursor + post-cursor tail (skin-effect proxy)
             # Standard RC low-pass proxy: instantaneous rise, exponential decay
             # Peak (main cursor) is strictly at index 0
-            h = torch.exp(-t / tau) 
-            
+            h = torch.exp(-t / tau)
+
             # Add discrete reflections (via/connector proxy)
             num_reflections = torch.randint(1, 4, (1,)).item()
             for _ in range(num_reflections):
                 idx = torch.randint(5, self.num_taps, (1,)).item()
                 h[idx] += torch.empty(1).uniform_(-0.2, 0.2).item()
-                
+
             h = h / torch.norm(h) # Normalize energy
             channels.append(h)
-            
+
         return torch.stack(channels)
 
     def add_noise(self, signal, snr_db):
@@ -115,11 +115,11 @@ class WirelineChannelGenerator:
 # =============================================================================
 
 
-# either the CTLE parameters nor the DFE parameters are encoded as standard trainable weights. 
-# It is easy to assume the CTLE has trainable weights because it is defined as a PyTorch nn.Module 
-# (class DifferentiableCTLE(nn.Module)), whereas the DFE is just handled mathematically in the loop. 
-# However, if you look at how they are actually implemented and updated, both are treated as dynamic 
-#state variables rather than static neural network weights.
+# either the CTLE parameters nor the DFE parameters are encoded as standard trainable weights.
+# It is easy to assume the CTLE has trainable weights because it is defined as a PyTorch nn.Module
+# (class DifferentiableCTLE(nn.Module)), whereas the DFE is just handled mathematically in the loop.
+# However, if you look at how they are actually implemented and updated, both are treated as dynamic
+# state variables rather than static neural network weights.
 
 # ==========================================
 # 1. Differentiable Parametric CTLE
@@ -209,11 +209,11 @@ class MultiRateLearnedNLMS(nn.Module):
         super().__init__()
         # State: [e_t, EMA_t, norm(X), current_mu_dfe, current_peaking]
         self.rnn = nn.GRUCell(state_dim, hidden_dim)
-        
+
         # Separate heads for DFE step size and CTLE step size
         self.head_dfe = nn.Linear(hidden_dim, 1)
         self.head_ctle = nn.Linear(hidden_dim, 1)
-        
+
     def forward(self, state_features, hidden_state, update_ctle=False):
         hidden_state = self.rnn(state_features, hidden_state)
 
@@ -223,10 +223,10 @@ class MultiRateLearnedNLMS(nn.Module):
 
         if update_ctle:
             # CTLE step size is typically smaller to prevent instability
-            mu_ctle = torch.tanh(self.head_ctle(hidden_state)) * 0.05 
+            mu_ctle = torch.tanh(self.head_ctle(hidden_state)) * 0.05
         else:
             mu_ctle = torch.zeros_like(mu_dfe)
-            
+
         return mu_dfe, mu_ctle, hidden_state
 
 
@@ -238,7 +238,7 @@ class MultiRateLearnedNLMS(nn.Module):
 
 # Memory of the "Optimization Path" (Statefulness)
 # Optimization is an iterative process where the current state ($w_t$) is a direct result of all previous decisions.
-#   * MLP Approach: An MLP is stateless. It would see the current error $e_t$ and the current gradient, but it wouldn't know if the error has been steadily decreasing for 50 cycles or if it’s oscillating wildly.
+#   * MLP Approach: An MLP is stateless. It would see the current error $e_t$ and the current gradient, but it wouldn't know if the error has been steadily decreasing for 50 cycles or if it's oscillating wildly.
 #   * RNN Advantage: The hidden_state in your MultiRateLearnedNLMS acts as a "memory bank." It captures the momentum and curvature of the loss landscape. It can distinguish between "I'm in a flat plateau and need to speed up" vs. "I'm near the minimum and
 #     need to decelerate to prevent overshoot.
 
@@ -249,14 +249,14 @@ class MultiRateLearnedNLMS(nn.Module):
 #     typically trained on instantaneous samples, lacks this "look-ahead" capability during its own training phase.
 
 # * Handling Channel Drift
-# An MLP trained on static features will completely fail to adapt to out-of-distribution channel drift. If the channel slowly shifts due to temperature 
-# changes, an MLP has no temporal mechanism to realize the steady-state weights are slowly decaying in effectiveness. The RNN's hidden state continuously 
-# monitors the error sequence, allowing it to "wake up" and temporarily increase μ to track the drift.
+# An MLP trained on static features will completely fail to adapt to out-of-distribution channel drift. If the channel slowly shifts due to temperature
+# changes, an MLP has no temporal mechanism to realize the steady-state weights are slowly decaying in effectiveness. The RNN's hidden state continuously
+# monitors the error sequence, allowing it to "wake up" and temporarily increase $\mu$ to track the drift.
 
 # * Why not just use a "Feature List" with an MLP?
 # You could pass "history" features to an MLP (e.g., a window of the last 10 errors). However:
 #   1. Fixed Window: You'd have to pre-define exactly how much history matters (e.g., exactly 10 steps). The RNN learns to keep what is useful and discard what isn't dynamically.
-#   2. Vanishing Gradients: Simple MLPs struggle to learn dependencies across long sequences of updates. The GRU architecture is specifically designed to manage gradient flow through time, ensuring that the "meta-loss" from step 50 can effectively update   
+#   2. Vanishing Gradients: Simple MLPs struggle to learn dependencies across long sequences of updates. The GRU architecture is specifically designed to manage gradient flow through time, ensuring that the "meta-loss" from step 50 can effectively update
 #      the optimizer's weights to improve its decision at step 1.
 # ==========================================
 
@@ -265,7 +265,7 @@ class MultiRateLearnedNLMS(nn.Module):
 # ==========================================
 def cross_correlate_sync_batch(tx, rx, max_delay=50):
     """
-    Computes integer sample delay for each element in the batch using 
+    Computes integer sample delay for each element in the batch using
     cross-correlation. This accounts for channel + CTLE group delay.
     """
     batch_size = tx.shape[0]
@@ -274,7 +274,7 @@ def cross_correlate_sync_batch(tx, rx, max_delay=50):
     sync_len = 200
     tx_sync = tx[:, :sync_len]
     rx_sync = rx[:, :sync_len + max_delay]
-    
+
     for i in range(batch_size):
         corrs = []
         for d in range(max_delay):
@@ -283,9 +283,15 @@ def cross_correlate_sync_batch(tx, rx, max_delay=50):
         delays.append(torch.argmax(torch.abs(torch.tensor(corrs))).item())
     return delays
 
-def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, batch_size=64, unroll_len=50, ablate_ctle=False):
+def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, batch_size=64,
+                            initial_unroll=10, max_unroll=100, unroll_step_epoch=20, ablate_ctle=False):
     """
-    Trains the learned optimizer using TBPTT with robust synchronization.
+    Trains the learned optimizer using TBPTT with progressive curriculum learning.
+
+    Curriculum Parameters:
+        initial_unroll: Starting TBPTT truncation length (default: 10)
+        max_unroll: Maximum TBPTT truncation length (default: 50)
+        unroll_step_epoch: Epoch interval between unroll length increases (default: 20)
     """
     if ablate_ctle:
         print("!!! RUNNING IN ABLATION MODE: CTLE CONTROL DISABLED !!!")
@@ -295,16 +301,27 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
     ctle_update_rate = 10
     loss_history = []
     ss_history = []  # Steady-state MSE history
-    unroll_history = []  # Track unroll length per epoch
+    unroll_history = []
 
     for epoch in range(epochs):
+        # ============================================================
+        # Prompt 2: Mathematical Formulation of the Progressive Schedule
+        # Calculate the active unroll length for the current epoch
+        # Lactive = min(Lmax, Linit + (floor(epoch/step_epoch) * ΔL))
+        # ============================================================
+        current_unroll_len = min(
+            max_unroll,
+            initial_unroll + (epoch // unroll_step_epoch) * UNROLL_DELTA
+        )
+        print(f"Epoch {epoch + 1}/{epochs} | Active TBPTT Horizon: {current_unroll_len}")
+
         tx_symbols = torch.sign(torch.randn(batch_size, total_seq_len))
         rx_base, h_batch = channel_gen.generate_received_signal(tx_symbols, batch_size)
-        
+
         with torch.no_grad():
             rx_init = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
             batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
-        
+
         common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
 
         hidden_state = torch.zeros(batch_size, 32)
@@ -323,7 +340,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         rx_buffer = torch.zeros(batch_size, ctle.num_taps)
 
         decision_buffer = torch.zeros(batch_size, dfe.num_taps)
-        ema_error = torch.ones(batch_size, 1) 
+        ema_error = torch.ones(batch_size, 1)
         ema_beta = 0.95
 
         effective_seq_len = total_seq_len - common_delay
@@ -332,10 +349,14 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         num_steps = 0
         ss_steps = 0
 
-        for t_start in range(0, effective_seq_len, unroll_len):
+        # ============================================================
+        # Prompt 3: Dynamic Graph Truncation Application
+        # Use current_unroll_len instead of static unroll_len
+        # ============================================================
+        for t_start in range(0, effective_seq_len, current_unroll_len):
             meta_optimizer.zero_grad()
             loss = 0
-            
+
             hidden_state = hidden_state.detach()
             dfe_weights = dfe_weights.detach()
             w_main = w_main.detach()
@@ -343,8 +364,9 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
             decision_buffer = decision_buffer.detach()
             ema_error = ema_error.detach()
             rx_buffer = rx_buffer.detach()
-            
-            current_block_len = min(unroll_len, effective_seq_len - t_start)
+
+            # Use current_unroll_len for block length calculation
+            current_block_len = min(current_unroll_len, effective_seq_len - t_start)
 
             for t in range(t_start, t_start + current_block_len):
                 rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
@@ -411,7 +433,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
                 decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
                 decision_buffer[:, 0] = soft_decision.squeeze(-1)
-                
+
                 step_mse = torch.mean(e_t ** 2)
                 loss += step_mse
                 epoch_total_mse += step_mse.item()
@@ -431,12 +453,11 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         avg_ss_mse = epoch_ss_mse / ss_steps if ss_steps > 0 else avg_epoch_mse
         loss_history.append(avg_epoch_mse)
         ss_history.append(avg_ss_mse)
-        unroll_history.append(unroll_len)
-        print(f"Epoch {epoch + 1}/{epochs} | Avg MSE: {avg_epoch_mse:.6f} | SS MSE: {avg_ss_mse:.6f}")
+        unroll_history.append(current_unroll_len)
+        print(f"Epoch {epoch + 1}/{epochs} | Horizon: {current_unroll_len} | Avg MSE: {avg_epoch_mse:.6f} | SS MSE: {avg_ss_mse:.6f}")
 
-    return learned_opt, loss_history, ss_history
+    return learned_opt, loss_history, ss_history, unroll_history
 
-# Currently, the code assumes the "hard work" of sampling the analog channel into discrete taps is already done, and it operates entirely in the normalized digital domain.
 
 # ==========================================
 # 4. Execution Block
@@ -444,6 +465,8 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 if __name__ == "__main__":
     # --- CONFIGURATION (from config.py) ---
     # See config.py for all common settings
+    # Note: Override EPOCHS for longer progressive training
+    EPOCHS = 620  # Override default for progressive training
     # --------------------------------------------------
 
     # Instantiate modules
@@ -458,19 +481,24 @@ if __name__ == "__main__":
     print(f"CTLE taps: {CTLE_TAPS}")
     print(f"SNR range: {SNR_RANGE} dB")
     print(f"Batch size: {BATCH_SIZE}")
-    print(f"Unroll length (TBPTT): {UNROLL_LEN}")
+    print(f"Curriculum Schedule:")
+    print(f"  - Initial unroll: {INITIAL_UNROLL}")
+    print(f"  - Max unroll: {MAX_UNROLL}")
+    print(f"  - Step epoch: {UNROLL_STEP_EPOCH}")
     print("-" * 50)
 
     # Train the learned optimizer
-    print("Starting meta-training...")
-    trained_model, loss_history, ss_history = train_learned_optimizer(
+    print("Starting meta-training with progressive curriculum...")
+    trained_model, loss_history, ss_history, unroll_history = train_learned_optimizer(
         channel_gen=channel_gen,
         dfe=dfe,
         ctle=ctle,
         learned_opt=learned_opt,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
-        unroll_len=UNROLL_LEN,
+        initial_unroll=INITIAL_UNROLL,
+        max_unroll=MAX_UNROLL,
+        unroll_step_epoch=UNROLL_STEP_EPOCH,
         ablate_ctle=ABLATE_CTLE
     )
 
@@ -478,24 +506,26 @@ if __name__ == "__main__":
     print("Meta-training completed!")
     
     # Calculate final stage averages:
-    # 1. Overall Average (last 20% of epochs)
-    # 2. Steady-State Average (last 20% of epochs, after symbol 200)
-    final_stage_start = int(len(loss_history) * 0.8)
-    final_stage_avg_mse = sum(loss_history[final_stage_start:]) / len(loss_history[final_stage_start:])
-    final_stage_ss_mse = sum(ss_history[final_stage_start:]) / len(ss_history[final_stage_start:])
+    # 1. Overall Average (epochs where unroll == max_unroll)
+    # 2. Steady-State Average (epochs where unroll == max_unroll, after symbol 200)
+    final_stage_mses = [loss_history[i] for i, u in enumerate(unroll_history) if u == MAX_UNROLL]
+    final_stage_ss_mses = [ss_history[i] for i, u in enumerate(unroll_history) if u == MAX_UNROLL]
     
+    final_avg_mse = sum(final_stage_mses) / len(final_stage_mses) if final_stage_mses else loss_history[-1]
+    final_ss_mse = sum(final_stage_ss_mses) / len(final_stage_ss_mses) if final_stage_ss_mses else ss_history[-1]
+
     print(f"Final epoch Average MSE: {loss_history[-1]:.6f}")
     print(f"Final epoch Steady-State MSE: {ss_history[-1]:.6f}")
-    print(f"Final stage (last 20%) Avg MSE: {final_stage_avg_mse:.6f}")
-    print(f"Final stage (last 20%) Steady-State MSE: {final_stage_ss_mse:.6f}")
+    print(f"Final stage (unroll={MAX_UNROLL}) Avg MSE: {final_avg_mse:.6f}")
+    print(f"Final stage (unroll={MAX_UNROLL}) Steady-State MSE: {final_ss_mse:.6f}")
     print("-" * 50)
 
 # A note on why ablation of CTLE does not cause that much of a difference in performance:
 # Final average MSE: 0.484707 [ctle ablation] vs Final average MSE: 0.464771[no ablation]
-# Convolving a 2-tap difference filter against a 50-tap heavy exponential tail alters the 
+# Convolving a 2-tap difference filter against a 50-tap heavy exponential tail alters the
 # immediate post-cursor but mathematically cannot shorten a 50-tap tail enough to fit inside a 10-tap Decision Feedback Equalizer (DFE).
-# The optimizer extracts a tiny ~0.02 MSE improvement by slightly reshaping the main cursor, but it hits the physical limitation of the 
-# 2-tap proxy. To demonstrate a massive performance gap between ablate_ctle = True and False, the CTLE must be given a physical impulse 
+# The optimizer extracts a tiny ~0.02 MSE improvement by slightly reshaping the main cursor, but it hits the physical limitation of the
+# 2-tap proxy. To demonstrate a massive performance gap between ablate_ctle = True and False, the CTLE must be given a physical impulse
 # response capable of acting as an inverse filter to the channel's dominant pole.
 
 # A note on the difference in memory for the different implementations
@@ -516,31 +546,3 @@ if __name__ == "__main__":
 #     State Variables: The neural network's hidden state (ht​) via a GRU, supplemented by engineered momentum features like the Exponential Moving Average (EMA) of the error.
 #     Mechanism: Instead of memorizing input covariance like RLS, the GRU learns what temporal features are useful to remember. It tracks the trajectory of the error surface over time. If the sequence of past gradients indicates the weights are far from convergence, the hidden state retains this momentum and outputs a large step size (μt​).
 #     Mathematical Implication: This allows the optimizer to exhibit "gear shifting" —taking large steps early when uncertainty is high, and small steps late when the EMA error stabilizes. It approximates the convergence benefits of second-order memory without the O(N2) matrix inversion penalty.
-
-
-# A note about Truncated BPTT :
-# 1. Chunking the Sequence
-# The outer loop divides the total transmission sequence into smaller blocks defined by the unroll_len variable (which is set to 50).
-#     for t_start in range(0, effective_seq_len, unroll_len):
-
-# 2. Severing the Graph (Detaching)
-# Before processing a new chunk, the code purposefully cuts the computational graph's connection to the previous chunk's history. If it didn't do this, PyTorch would try to calculate the chain rule all the way back to t=0, crashing your memory. It does this using the .detach() method on all state variables:
-#     hidden_state = hidden_state.detach()
-#     dfe_weights = dfe_weights.detach()
-#     decision_buffer = decision_buffer.detach()
-
-# 3. The Unrolled Forward Pass
-# Inside the inner loop, the model processes the signal step-by-step for the duration of the chunk. It calculates the instantaneous error et​, squares it to find the step's Mean Squared Error (MSE), and accumulates it into a running total.
-#     step_mse = torch.mean(e_t ** 2)
-#     loss += step_mse
-
-# 4. Flowing Backwards
-# Once the inner loop finishes its 50-step sequence, the code takes the accumulated loss, averages it, and fires the backward pass. Because PyTorch built a computational graph during the inner loop, this command sends the gradients flowing backward through those 50 steps to figure out how the learned optimizer's weights should change.
-#     (loss / current_block_len).backward()
-
-# 5. Safeguards and Weight Updates
-
-# Before actually updating the optimizer's neural network weights, the code applies gradient clipping. This acts as a safety valve to ensure the unrolled chain rule operations ∏∇w​f(wt​) don't result in numbers so large that they break the model. Finally, the optimizer takes a step to update its own parameters.
-
-#     torch.nn.utils.clip_grad_norm_(learned_opt.parameters(), 1.0)
-#     meta_optimizer.step()
