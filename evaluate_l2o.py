@@ -8,7 +8,8 @@ import argparse
 from config import *
 
 # Import architectures from training scripts
-from l2o_basic import MultiRateLearnedNLMS, WirelineChannelGenerator, DifferentiableCTLE, DifferentiableDFE, cross_correlate_sync_batch
+from l2o_basic import MultiRateLearnedNLMS, DifferentiableCTLE, DifferentiableDFE, cross_correlate_sync_batch
+from wireline_channel import WirelineChannelGenerator
 from l2o_mlp import MultiRateLearnedMLP
 from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe
 

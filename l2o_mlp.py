@@ -11,76 +11,7 @@ from config import *
 # instead of an RNN to provide temporal context.
 # ==========================================
 
-# ===========================================
-# 1. Channel Generation (from l2o_basic.py)
-# ==========================================
-class WirelineChannelGenerator:
-    def __init__(self, num_taps=50, snr_range=(15, 25)):
-        """
-        Generates channels with lengths of 20-50 taps
-        and AWGN with SNR of 15-25 dB[cite: 55].
-        """
-        self.num_taps = num_taps
-        self.snr_range = snr_range
-
-    def generate_batch(self, batch_size):
-        t = torch.linspace(0, 5, self.num_taps)
-
-        channels = []
-        for _ in range(batch_size):
-            tau = torch.empty(1).uniform_(0.5, 1.5).item()
-            h = torch.exp(-t / tau)
-
-            num_reflections = torch.randint(1, 4, (1,)).item()
-            for _ in range(num_reflections):
-                idx = torch.randint(5, self.num_taps, (1,)).item()
-                h[idx] += torch.empty(1).uniform_(-0.2, 0.2).item()
-
-            h = h / torch.norm(h)
-            channels.append(h)
-
-        return torch.stack(channels)
-
-    def add_noise(self, signal, snr_db):
-        """Adds AWGN based on specified SNR[cite: 55]."""
-        snr_linear = 10 ** (snr_db / 10)
-        signal_power = torch.mean(signal ** 2, dim=-1, keepdim=True)
-        noise_power = signal_power / snr_linear
-        noise = torch.randn_like(signal) * torch.sqrt(noise_power)
-        return signal + noise
-
-    def generate_received_signal(self, tx_symbols, batch_size):
-        """
-        Generates the full received signal by convolving symbols with channel
-        and adding AWGN noise. Returns (rx_noisy, h_batch).
-        """
-        channel_len = self.num_taps
-        tx_padded = F.pad(tx_symbols, (channel_len - 1, 0))
-        tx_reshaped = tx_padded.view(1, batch_size, -1)
-        h_batch = self.generate_batch(batch_size)
-
-        # Main Cursor Normalization / Ideal AGC
-        peak_vals, _ = torch.max(torch.abs(h_batch), dim=1, keepdim=True)
-        h_batch = h_batch / (peak_vals + 1e-8)
-
-        h_reshaped = h_batch.view(batch_size, 1, channel_len)
-        h_reshaped_flipped = torch.flip(h_reshaped, dims=[-1])
-
-        # Apply the channel filters using grouped convolution
-        rx_clean = F.conv1d(tx_reshaped, h_reshaped_flipped, groups=batch_size)
-        rx_clean = rx_clean.view(batch_size, -1)
-
-        # Add AWGN
-        snr_db = torch.empty(batch_size).uniform_(self.snr_range[0], self.snr_range[1])
-        snr_linear = 10 ** (snr_db / 10)
-        signal_power = torch.mean(rx_clean ** 2, dim=-1, keepdim=True)
-        noise_power = signal_power / snr_linear.unsqueeze(-1)
-        noise_std = torch.sqrt(noise_power)
-
-        rx_noisy = rx_clean + noise_std * torch.randn_like(rx_clean)
-
-        return rx_noisy, h_batch
-
+from wireline_channel import WirelineChannelGenerator
 
 # ==========================================
 # 2. Differentiable Parametric CTLE
