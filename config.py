@@ -95,3 +95,11 @@ L2O_MLP_HIDDEN_DIM = 64    # Hidden dimension for MLP (larger than RNN due to in
 # Ablation Settings
 # ==========================================
 ABLATE_CTLE = False     # Set to True to disable CTLE control
+
+# ==========================================
+# Evaluation Settings (for evaluate_l2o.py and benchmark_nlms.py)
+# ==========================================
+EVAL_BATCH_SIZE = 100   # Number of channels to evaluate over
+EVAL_SEQ_LENGTH = 1000  # Sequence length for evaluation
+EVAL_BURN_IN = 200     # Symbol index to start steady-state calculation
+FIXED_CTLE_PEAKING = 0.5  # CTLE peaking gain for baseline evaluation

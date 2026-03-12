@@ -186,10 +186,10 @@ class MultiRateLearnedMLP(nn.Module):
         features = self.mlp(history_buffer)
 
         # Bound step sizes exactly as in l2o_basic.py
-        mu_dfe = torch.sigmoid(self.head_dfe(features)) * 0.05
+        mu_dfe = torch.sigmoid(self.head_dfe(features)) * L2O_DFE_HEAD_SCALE
 
         if update_ctle:
-            mu_ctle = torch.tanh(self.head_ctle(features)) * 0.05
+            mu_ctle = torch.tanh(self.head_ctle(features)) * L2O_CTLE_HEAD_SCALE
         else:
             mu_ctle = torch.zeros_like(mu_dfe)
 
@@ -199,14 +199,22 @@ class MultiRateLearnedMLP(nn.Module):
 # ==========================================
 # 5. TBPTT Meta-Training Loop with History Buffer
 # ==========================================
-def cross_correlate_sync_batch(tx, rx, max_delay=50):
+def cross_correlate_sync_batch(tx, rx, max_delay=50, sync_len=None):
     """
     Computes integer sample delay for each element in the batch using
     cross-correlation.
     """
     batch_size = tx.shape[0]
+    seq_len = tx.shape[1]
     delays = []
-    sync_len = 200
+
+    # Use up to 200 symbols for sync, but not more than available
+    if sync_len is None:
+        sync_len = min(200, seq_len - max_delay)
+
+    if sync_len <= 0:
+        raise ValueError(f"Sequence length {seq_len} too short for max_delay {max_delay}")
+
     tx_sync = tx[:, :sync_len]
     rx_sync = rx[:, :sync_len + max_delay]
 
@@ -449,6 +457,11 @@ if __name__ == "__main__":
     print(f"Final epoch Steady-State MSE: {ss_history[-1]:.6f}")
     print(f"Final stage (last 20%) Avg MSE: {final_stage_avg_mse:.6f}")
     print(f"Final stage (last 20%) Steady-State MSE: {final_stage_ss_mse:.6f}")
+    
+    # Save the trained model
+    model_path = "l2o_mlp_model.pth"
+    torch.save(trained_model.state_dict(), model_path)
+    print(f"Trained model saved to {model_path}")
     print("-" * 50)
 
 

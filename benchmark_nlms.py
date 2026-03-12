@@ -347,6 +347,77 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
     return torch.tensor(mse_log), weights
 
 # ==========================================
+# 3c. Batch NLMS Wrapper
+# ==========================================
+def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_forcing=False,
+                       use_gear_shift=False, mu_fast=0.2, mu_slow=0.01, gear_threshold=0.5, ema_alpha=0.05):
+    """
+    Wrapper to run NLMS DFE over a batch of channels.
+
+    Inputs:
+        rx_batch: [batch_size, seq_len]
+        tx_batch: [batch_size, seq_len]
+
+    Output:
+        avg_mse_history: Averaged MSE across batch dimension [seq_len]
+        final_weights: Final DFE weights from last channel [num_taps]
+    """
+    batch_size = rx_batch.shape[0]
+    mse_histories = []
+
+    for i in range(batch_size):
+        rx_i = rx_batch[i]  # [seq_len]
+        tx_i = tx_batch[i]  # [seq_len]
+
+        mse_history, weights, w_main = run_nlms_dfe(
+            rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
+            use_gear_shift=use_gear_shift, mu_fast=mu_fast, mu_slow=mu_slow,
+            gear_threshold=gear_threshold, ema_alpha=ema_alpha
+        )
+        mse_histories.append(mse_history)
+
+    # Stack and average across batch
+    mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
+    avg_mse_history = torch.mean(mse_stacked, dim=0)   # [seq_len]
+
+    return avg_mse_history, weights
+
+
+# ==========================================
+# 3d. Batch RLS Wrapper
+# ==========================================
+def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teacher_forcing=False):
+    """
+    Wrapper to run RLS DFE over a batch of channels.
+
+    Inputs:
+        rx_batch: [batch_size, seq_len]
+        tx_batch: [batch_size, seq_len]
+
+    Output:
+        avg_mse_history: Averaged MSE across batch dimension [seq_len]
+        final_weights: Final DFE weights from last channel [num_taps + 1]
+    """
+    batch_size = rx_batch.shape[0]
+    mse_histories = []
+
+    for i in range(batch_size):
+        rx_i = rx_batch[i]  # [seq_len]
+        tx_i = tx_batch[i]  # [seq_len]
+
+        mse_history, weights = run_rls_dfe(
+            rx_i, tx_i, num_taps=num_taps, lam=lam, delta=delta, teacher_forcing=teacher_forcing
+        )
+        mse_histories.append(mse_history)
+
+    # Stack and average across batch
+    mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
+    avg_mse_history = torch.mean(mse_stacked, dim=0)  # [seq_len]
+
+    return avg_mse_history, weights
+
+
+# ==========================================
 # 4. Synchronization Helper
 # ==========================================
 def cross_correlate_sync(tx, rx, max_delay=100):
@@ -357,14 +428,42 @@ def cross_correlate_sync(tx, rx, max_delay=100):
     # Use the first 500 symbols for robust synchronization
     tx_sync = tx[:500]
     rx_sync = rx[:1000]
-    
+
     corrs = []
     for d in range(max_delay):
         # Compute correlation at delay d
         c = torch.dot(tx_sync, rx_sync[d:d+500])
         corrs.append(c.item())
-        
+
     return torch.argmax(torch.abs(torch.tensor(corrs))).item()
+
+
+def cross_correlate_sync_batch(tx, rx, max_delay=50, sync_len=None):
+    """
+    Computes integer sample delay for each element in the batch using
+    cross-correlation. This accounts for channel + CTLE group delay.
+    """
+    batch_size = tx.shape[0]
+    seq_len = tx.shape[1]
+    delays = []
+
+    # Use up to 200 symbols for sync, but not more than available
+    if sync_len is None:
+        sync_len = min(200, seq_len - max_delay)
+
+    if sync_len <= 0:
+        raise ValueError(f"Sequence length {seq_len} too short for max_delay {max_delay}")
+
+    tx_sync = tx[:, :sync_len]
+    rx_sync = rx[:, :sync_len + max_delay]
+
+    for i in range(batch_size):
+        corrs = []
+        for d in range(max_delay):
+            c = torch.dot(tx_sync[i], rx_sync[i, d:d+sync_len])
+            corrs.append(c.item())
+        delays.append(torch.argmax(torch.abs(torch.tensor(corrs))).item())
+    return delays
 
 # ==========================================
 # 5. Benchmark Execution
@@ -373,68 +472,77 @@ if __name__ == "__main__":
     # --- CONFIGURATION (from config.py) ---
     # See config.py for all common settings
     # --------------------------------------------------
-    
+
+    # Use a batch size > 1 for statistically valid evaluation
+    BENCH_BATCH_SIZE = 100
+    EVAL_LENGTH = EVAL_SEQ_LENGTH  # Evaluation sequence length (from config.py)
+    # Use a smaller BURN_IN for benchmark (200 is used for L2O eval with 500 symbols)
+    BURN_IN = 500  # Steady-state starts after symbol 500
+
     print(f"Initializing Benchmark...")
     print(f"Channel Taps: {CH_TAPS}")
     print(f"DFE Taps: {DFE_TAPS}")
     print(f"CTLE Taps: {CTLE_TAPS} (Fixed Peaking: {FIXED_PEAKING})")
     print(f"SNR Range: {SNR_RANGE} dB")
+    print(f"Batch Size: {BENCH_BATCH_SIZE}")
     print("-" * 30)
 
-    # 1. Generate test data (Retain ground-truth channel h)
+    # 1. Generate test data (batch of channels)
     gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE)
-    tx = torch.sign(torch.randn(1, SEQ_LENGTH))
-    rx_raw, h_true = gen.generate_received_signal(tx, batch_size=1)
+    tx = torch.sign(torch.randn(BENCH_BATCH_SIZE, EVAL_LENGTH))
+    rx_raw, h_true = gen.generate_received_signal(tx, batch_size=BENCH_BATCH_SIZE)
 
     # 2. Apply Fixed CTLE
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
-    peaking_gain = torch.ones(1, 1) * FIXED_PEAKING
-    rx_ctle = ctle(rx_raw, peaking_gain).squeeze()
-    tx = tx.squeeze()
+    peaking_gain = torch.ones(BENCH_BATCH_SIZE, 1) * FIXED_PEAKING
+    rx_ctle = ctle(rx_raw, peaking_gain)
 
     # 3. Delay Alignment (Synchronization via Cross-Correlation)
-    # This accounts for both channel delay AND CTLE group delay
-    cursor_delay = cross_correlate_sync(tx, rx_ctle)
-    print(f"Synchronized main cursor at delay: {cursor_delay}")
+    # Use common delay (median) for batch alignment
+    batch_delays = cross_correlate_sync_batch(tx, rx_ctle)
+    common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
+    print(f"Synchronized main cursor at delay (median): {common_delay}")
 
-    # Align rx and tx (use [cursor_delay:] for both to avoid -0 bug)
-    rx_aligned = rx_ctle[cursor_delay:]
-    tx_aligned = tx[cursor_delay:]
-    
-    print(f"Aligned sequence length: {len(tx_aligned)}")
+    # Align rx and tx using the common delay
+    rx_aligned = rx_ctle[:, common_delay:]
+    tx_aligned = tx[:, common_delay:]
+
+    print(f"Aligned sequence length: {tx_aligned.shape[1]}")
     print("-" * 30)
 
-    # 4. Parameter Sweep (NLMS DFE)
+    # 4. Parameter Sweep (NLMS DFE) - using batch wrapper
     mu_values = NLMS_MU_VALUES
     plt.figure(figsize=(10, 6))
 
     # Define burn-in period to ignore initial convergence outliers
-    print(f"Acquisition vs Steady-State Performance:")
-    print(f"{'Method':<25} | {'MSE @ 500':<12} | {'Steady-State':<15} | {'Final w_main'}")
-    print("-" * 75)
+    print(f"Acquisition vs Steady-State Performance (Batch-Averaged):")
+    print(f"{'Method':<25} | {'MSE @ 500':<12} | {'Steady-State':<15}")
+    print("-" * 55)
 
     for mu_val in mu_values:
-        mse_history, final_w, w_main = run_nlms_dfe(rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=mu_val, teacher_forcing=True)
-        
+        avg_mse_history, final_w = run_batch_nlms_dfe(
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=mu_val, teacher_forcing=False
+        )
+
         # 1. Acquisition MSE (Average of symbols 0-500)
-        acq_mse = torch.mean(mse_history[:500]).item()
+        acq_mse = torch.mean(avg_mse_history[:500]).item()
         acq_mse_db = 10 * torch.log10(torch.tensor(acq_mse)).item()
 
         # 2. Steady-State MSE (Average of symbols BURN_IN to end)
-        ss_mse = torch.mean(mse_history[BURN_IN:]).item()
+        ss_mse = torch.mean(avg_mse_history[BURN_IN:]).item()
         ss_mse_db = 10 * torch.log10(torch.tensor(ss_mse)).item()
-        
+
         method_name = f"NLMS (mu={mu_val})"
-        print(f"{method_name:<25} | {acq_mse_db:>7.2f} dB | {ss_mse_db:>10.2f} dB | {w_main.item():.3f}")
+        print(f"{method_name:<25} | {acq_mse_db:>7.2f} dB | {ss_mse_db:>10.2f} dB")
 
-        smoothed_mse = pd.Series(mse_history.numpy()).ewm(span=200).mean()
-        plt.plot(10 * torch.log10(torch.tensor(smoothed_mse)), label=f'NLMS (mu={mu_val}, w_main={w_main.item():.3f})')
+        smoothed_mse = pd.Series(avg_mse_history.numpy()).ewm(span=200).mean()
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_mse)), label=f'NLMS (mu={mu_val})')
 
-    # 4b. Run Gear-Shifting NLMS (Variable Step-Size)
-    mse_history_gs, final_w_gs, w_main_gs = run_nlms_dfe(
+    # 4b. Run Gear-Shifting NLMS (Variable Step-Size) - using batch wrapper
+    avg_mse_history_gs, final_w_gs = run_batch_nlms_dfe(
         rx_aligned, tx_aligned, num_taps=DFE_TAPS,
         mu=0.1,  # Base mu (used when use_gear_shift=False)
-        teacher_forcing=True,
+        teacher_forcing=False,
         use_gear_shift=True,  # Enable gear-shifting
         mu_fast=GEAR_SHIFT_MU_FAST,
         mu_slow=GEAR_SHIFT_MU_SLOW,
@@ -443,36 +551,36 @@ if __name__ == "__main__":
     )
 
     # Acquisition vs Steady-State for Gear-Shift
-    acq_mse_gs = torch.mean(mse_history_gs[:500]).item()
+    acq_mse_gs = torch.mean(avg_mse_history_gs[:500]).item()
     acq_mse_gs_db = 10 * torch.log10(torch.tensor(acq_mse_gs)).item()
-    ss_mse_gs = torch.mean(mse_history_gs[BURN_IN:]).item()
+    ss_mse_gs = torch.mean(avg_mse_history_gs[BURN_IN:]).item()
     ss_mse_gs_db = 10 * torch.log10(torch.tensor(ss_mse_gs)).item()
-    
-    print(f"{'NLMS Gear-Shift':<25} | {acq_mse_gs_db:>7.2f} dB | {ss_mse_gs_db:>10.2f} dB | {w_main_gs.item():.3f}")
 
-    smoothed_mse_gs = pd.Series(mse_history_gs.numpy()).ewm(span=200).mean()
+    print(f"{'NLMS Gear-Shift':<25} | {acq_mse_gs_db:>7.2f} dB | {ss_mse_gs_db:>10.2f} dB")
+
+    smoothed_mse_gs = pd.Series(avg_mse_history_gs.numpy()).ewm(span=200).mean()
     plt.plot(
         10 * torch.log10(torch.tensor(smoothed_mse_gs)),
         color='purple', linewidth=2,
         label=f'NLMS Gear-Shift (mu_fast={GEAR_SHIFT_MU_FAST}, mu_slow={GEAR_SHIFT_MU_SLOW})'
     )
 
-    # 5. Run RLS DFE (optimal linear upper bound)
-    mse_history_rls, final_w_rls = run_rls_dfe(
+    # 5. Run RLS DFE (optimal linear upper bound) - using batch wrapper
+    avg_mse_history_rls, final_w_rls = run_batch_rls_dfe(
         rx_aligned, tx_aligned, num_taps=DFE_TAPS,
-        lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=True
+        lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=False
     )
-    
+
     # Acquisition vs Steady-State for RLS
-    acq_mse_rls = torch.mean(mse_history_rls[:500]).item()
+    acq_mse_rls = torch.mean(avg_mse_history_rls[:500]).item()
     acq_mse_rls_db = 10 * torch.log10(torch.tensor(acq_mse_rls)).item()
-    ss_mse_rls = torch.mean(mse_history_rls[BURN_IN:]).item()
+    ss_mse_rls = torch.mean(avg_mse_history_rls[BURN_IN:]).item()
     ss_mse_rls_db = 10 * torch.log10(torch.tensor(ss_mse_rls)).item()
-    
-    print(f"{'RLS (lam='+str(RLS_LAMBDA)+')':<25} | {acq_mse_rls_db:>7.2f} dB | {ss_mse_rls_db:>10.2f} dB | {final_w_rls[0].item():.3f}")
+
+    print(f"{'RLS (lam='+str(RLS_LAMBDA)+')':<25} | {acq_mse_rls_db:>7.2f} dB | {ss_mse_rls_db:>10.2f} dB")
     print("-" * 75)
 
-    smoothed_mse_rls = pd.Series(mse_history_rls.numpy()).ewm(span=200).mean()
+    smoothed_mse_rls = pd.Series(avg_mse_history_rls.numpy()).ewm(span=200).mean()
     plt.plot(
         10 * torch.log10(torch.tensor(smoothed_mse_rls)),
         color='black', linestyle='dashed', linewidth=2,
