@@ -12,6 +12,7 @@ from config import *
 # ==========================================
 
 from wireline_channel import WirelineChannelGenerator
+from utils import add_channel_args, get_channel_generator
 
 # ==========================================
 # 2. Differentiable Parametric CTLE
@@ -333,13 +334,20 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 # 6. Execution Block
 # ==========================================
 if __name__ == "__main__":
+    import argparse
+
     # --- CONFIGURATION (from config.py) ---
     # See config.py for all common settings
     # --------------------------------------------------
 
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Train Learned Optimizer (MLP)")
+    parser = add_channel_args(parser)
+    args = parser.parse_args()
+
     # Instantiate modules
     print("Initializing modules...")
-    channel_gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE)
+    channel_gen = get_channel_generator(args)
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
 
@@ -350,6 +358,7 @@ if __name__ == "__main__":
         hidden_dim=L2O_MLP_HIDDEN_DIM
     )
 
+    print(f"Channel type: {args.channel_type}")
     print(f"Channel taps: {CH_TAPS}")
     print(f"DFE taps: {DFE_TAPS}")
     print(f"CTLE taps: {CTLE_TAPS}")
@@ -390,7 +399,8 @@ if __name__ == "__main__":
     print(f"Final stage (last 20%) Steady-State MSE: {final_stage_ss_mse:.6f}")
     
     # Save the trained model
-    model_path = "l2o_mlp_model.pth"
+    suffix = "_ablate_ctle" if ABLATE_CTLE else ""
+    model_path = f"./models/l2o_mlp_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth"
     torch.save(trained_model.state_dict(), model_path)
     print(f"Trained model saved to {model_path}")
     print("-" * 50)

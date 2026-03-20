@@ -27,7 +27,8 @@ from config import *
 # gradients pass cleanly through this projection. If the pre-activation values become too large, the sigmoid will saturate, killing the gradient and halting CTLE adaptation entirely.
 
 
-from wireline_channel import WirelineChannelGenerator 
+from wireline_channel import WirelineChannelGenerator
+from utils import add_channel_args, get_channel_generator 
 # It is easy to assume the CTLE has trainable weights because it is defined as a PyTorch nn.Module 
 # (class DifferentiableCTLE(nn.Module)), whereas the DFE is just handled mathematically in the loop. 
 # However, if you look at how they are actually implemented and updated, both are treated as dynamic 
@@ -361,17 +362,25 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 # 4. Execution Block
 # ==========================================
 if __name__ == "__main__":
+    import argparse
+
     # --- CONFIGURATION (from config.py) ---
     # See config.py for all common settings
     # --------------------------------------------------
 
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Train Learned Optimizer (Basic)")
+    parser = add_channel_args(parser)
+    args = parser.parse_args()
+
     # Instantiate modules
     print("Initializing modules...")
-    channel_gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE)
+    channel_gen = get_channel_generator(args)
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
     learned_opt = MultiRateLearnedNLMS(state_dim=6, hidden_dim=32)
 
+    print(f"Channel type: {args.channel_type}")
     print(f"Channel taps: {CH_TAPS}")
     print(f"DFE taps: {DFE_TAPS}")
     print(f"CTLE taps: {CTLE_TAPS}")
@@ -408,7 +417,8 @@ if __name__ == "__main__":
     print(f"Final stage (last 20%) Avg MSE: {final_stage_avg_mse:.6f}")
     print(f"Final stage (last 20%) Steady-State MSE: {final_stage_ss_mse:.6f}")
     # Save the trained model
-    model_path = "l2o_basic_model.pth"
+    suffix = "_ablate_ctle" if ABLATE_CTLE else ""
+    model_path = f"./models/l2o_basic_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth"
     torch.save(trained_model.state_dict(), model_path)
     print(f"Trained model saved to {model_path}")
     print("-" * 50)

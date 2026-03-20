@@ -9,13 +9,16 @@ from config import *
 
 # Import architectures from training scripts
 from l2o_basic import MultiRateLearnedNLMS, DifferentiableCTLE, DifferentiableDFE, cross_correlate_sync_batch
-from wireline_channel import WirelineChannelGenerator
 from l2o_mlp import MultiRateLearnedMLP
 from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe
+from utils import add_channel_args, get_channel_generator
 
-def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100, seq_len=500, ctle_peaking=0.5):
+def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100, seq_len=500, ctle_peaking=0.5, ablate_ctle=False):
     """
     Evaluates a trained L2O model on a fresh batch of channels without weight updates.
+
+    Args:
+        ablate_ctle: If True, skip CTLE updates (use fixed CTLE) to match training with ABLATE_CTLE=True
     """
     model.eval()
     tx_symbols = torch.sign(torch.randn(batch_size, seq_len))
@@ -24,69 +27,73 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
     with torch.no_grad():
         rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
         batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
-    
+
     common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
-    
+
     # Initialize state
     hidden_state = torch.zeros(batch_size, 32) if model_type != "mlp" else None
     history_buffer = torch.zeros(batch_size, L2O_MLP_HISTORY_LEN, L2O_STATE_DIM) if model_type == "mlp" else None
-    
+
     dfe_weights = torch.zeros(batch_size, dfe.num_taps)
     w_main = torch.ones(batch_size, 1) * FFE_INIT
     latent_peaking = torch.zeros(batch_size, 1)
     rx_buffer = torch.zeros(batch_size, ctle.num_taps)
     decision_buffer = torch.zeros(batch_size, dfe.num_taps)
     ema_error = torch.ones(batch_size, 1)
-    
+
     mse_history = []
-    
+
     with torch.no_grad():
         effective_len = seq_len - common_delay
         for t in range(effective_len):
             rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
             ctle_peaking = torch.sigmoid(latent_peaking)
-            
+
             rx_buffer = torch.roll(rx_buffer, shifts=1, dims=1)
             rx_buffer[:, 0] = rx_t.squeeze(-1)
-            
+
             current_taps = ctle.base_lp.unsqueeze(0) + ctle_peaking * ctle.base_hp.unsqueeze(0)
             rx_eq = torch.sum(rx_buffer * current_taps, dim=1, keepdim=True)
-            
+
             dfe_feedback = torch.sum(decision_buffer * dfe_weights, dim=1, keepdim=True)
             y_out = (w_main * rx_eq) - dfe_feedback
             e_t = tx_symbols[:, t:t+1] - y_out
-            
+
             norm_sq = (rx_eq ** 2) + torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
             grad_proxy_ctle = e_t * rx_eq / norm_sq
-            
+
             state_features = torch.cat([
                 e_t, ema_error, norm_sq,
                 dfe_weights[:, 0:1],
                 ctle_peaking,
                 grad_proxy_ctle
             ], dim=1)
-            
+
             if model_type == "mlp":
                 history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
                 history_buffer[:, 0, :] = state_features
                 mu_dfe, mu_ctle = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
             else:
                 mu_dfe, mu_ctle, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
-            
+
+            # Ablation: Zero out CTLE updates to match training with ABLATE_CTLE=True
+            if ablate_ctle:
+                mu_ctle = torch.zeros_like(mu_ctle)
+
             ema_error = 0.95 * ema_error + 0.05 * (e_t ** 2)
             dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
             w_main = w_main + (mu_dfe * e_t * rx_eq / norm_sq)
-            
+
             if t % 10 == 0:
                 latent_peaking = latent_peaking + mu_ctle
-                
+
             tau = 0.1
             decision = torch.tanh(y_out / tau) # Match meta-training distribution
             decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
             decision_buffer[:, 0] = decision.squeeze(-1)
-            
+
             mse_history.append(torch.mean(e_t**2).item())
-            
+
     return torch.tensor(mse_history)
 
 if __name__ == "__main__":
@@ -100,12 +107,20 @@ if __name__ == "__main__":
                         help=f"Steady-state start index (default: {EVAL_BURN_IN})")
     parser.add_argument("--ctle_peaking", type=float, default=FIXED_CTLE_PEAKING,
                         help=f"CTLE peaking gain (default: {FIXED_CTLE_PEAKING})")
+    parser.add_argument("--ablate_ctle", action="store_true",
+                        help="Enable ablation mode for models trained with ABLATE_CTLE=True")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Path to a specific trained model file. If not provided, "
+                             "auto-generates paths based on channel_type and ablation settings.")
+    parser = add_channel_args(parser)
     args = parser.parse_args()
 
     batch_size = args.batch_size
     seq_len = args.seq_len
     burn_in = args.burn_in
     ctle_peaking = args.ctle_peaking
+    ablate_ctle = args.ablate_ctle
+    model_path = args.model_path
 
     # Use config values only if they meet minimum thresholds; otherwise use defaults
     DEFAULT_SEQ_LEN = 500
@@ -119,10 +134,13 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     print("Starting Comparative Evaluation (Inference Mode)...")
     print(f"Settings: batch_size={batch_size}, seq_len={seq_len}, burn_in={burn_in}")
+    print(f"Channel type: {args.channel_type}")
+    if ablate_ctle:
+        print("*** ABLATION MODE: CTLE updates disabled (matching ABLATE_CTLE=True training) ***")
     print("-" * 60)
 
     # Setup environment
-    gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE)
+    gen = get_channel_generator(args)
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
 
@@ -146,11 +164,27 @@ if __name__ == "__main__":
     results = {}
 
     # 1. Evaluate L2O Models
-    models_to_test = [
-        ("RNN Basic", "l2o_basic_model.pth", "rnn", MultiRateLearnedNLMS(6, 32)),
-        ("MLP", "l2o_mlp_model.pth", "mlp", MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM)),
-        ("RNN Progressive", "l2o_progressive_model.pth", "rnn", MultiRateLearnedNLMS(6, 32))
-    ]
+    # If model_path is provided, use it for a single model; otherwise auto-generate paths
+    suffix = "_ablate_ctle" if ablate_ctle else ""
+    ablate_label = " (Ablated)" if ablate_ctle else ""
+
+    if model_path:
+        # Use the explicitly provided model path
+        model_type = "rnn"  # Default, user should specify if MLP
+        if "mlp" in model_path.lower():
+            model_type = "mlp"
+        models_to_test = [
+            (f"Custom Model{ablate_label}", model_path, model_type,
+             MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM) if model_type == "mlp"
+             else MultiRateLearnedNLMS(6, 32))
+        ]
+    else:
+        # Auto-generate paths based on channel_type and ablation settings
+        models_to_test = [
+            (f"RNN Basic{ablate_label}", f"./models/l2o_basic_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32)),
+            (f"MLP{ablate_label}", f"./models/l2o_mlp_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "mlp", MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM)),
+            (f"RNN Progressive{ablate_label}", f"./models/l2o_progressive_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32))
+        ]
 
     plt.figure(figsize=(12, 7))
 
@@ -158,7 +192,7 @@ if __name__ == "__main__":
         try:
             model.load_state_dict(torch.load(path))
             print(f"Loaded {name} from {path}")
-            mse_trace = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking)
+            mse_trace = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
             avg_mse = torch.mean(mse_trace).item()
             ss_mse = torch.mean(mse_trace[burn_in:]).item()
             results[name] = (avg_mse, ss_mse)

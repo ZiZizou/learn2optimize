@@ -22,17 +22,18 @@ class AdvancedWirelineChannelGenerator:
         device (torch.device): Device to run computations on.
     """
 
-    def __init__(self, num_taps=150, snr_db=20.0, device=None):
+    def __init__(self, num_taps=150, snr_range=(15, 25), device=None):
         """
         Initialize the advanced wireline channel generator.
 
         Args:
             num_taps (int): Number of taps in the impulse response. Default is 150.
-            snr_db (float): Signal-to-noise ratio in dB. Default is 20.0.
+            snr_range (tuple): Signal-to-noise ratio range in dB as (min, max).
+                               Samples uniformly per batch. Default is (15, 25).
             device (torch.device, optional): Device for computations. If None, uses CUDA if available.
         """
         self.num_taps = num_taps
-        self.snr_db = snr_db
+        self.snr_range = snr_range
         self.device = device if device is not None else torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
@@ -249,16 +250,19 @@ class AdvancedWirelineChannelGenerator:
 
         Args:
             clean_signal (torch.Tensor): Clean received signal.
-            snr_db (float): Signal-to-noise ratio in dB.
+            snr_db (float or torch.Tensor): Signal-to-noise ratio in dB.
 
         Returns:
             torch.Tensor: Noisy received signal.
         """
-        # Calculate signal power
-        signal_power = torch.mean(clean_signal ** 2)
+        # Calculate signal power per batch element
+        signal_power = torch.mean(clean_signal ** 2, dim=-1, keepdim=True)
 
         # Calculate noise power from SNR
-        snr_linear = 10 ** (snr_db / 10.0)
+        if isinstance(snr_db, torch.Tensor):
+            snr_linear = 10 ** (snr_db.unsqueeze(-1) / 10.0)
+        else:
+            snr_linear = 10 ** (snr_db / 10.0)
         noise_power = signal_power / snr_linear
 
         # Generate Gaussian noise
@@ -321,8 +325,11 @@ class AdvancedWirelineChannelGenerator:
 
         rx_nonlinear = self._apply_nonlinearity(rx_clean, kappa_expanded)
 
-        # Step 6: Add AWGN
-        rx_noisy = self._add_awgn(rx_nonlinear, self.snr_db)
+        # Step 6: Add AWGN (sample SNR per batch element from range)
+        snr_db = torch.empty(batch_size, device=self.device).uniform_(
+            self.snr_range[0], self.snr_range[1]
+        )
+        rx_noisy = self._add_awgn(rx_nonlinear, snr_db)
 
         # Ensure output shapes are correct
         # rx_noisy: [batch_size, seq_len]

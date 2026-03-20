@@ -94,7 +94,7 @@ L2O_MLP_HIDDEN_DIM = 64    # Hidden dimension for MLP (larger than RNN due to in
 # ==========================================
 # Ablation Settings
 # ==========================================
-ABLATE_CTLE = False     # Set to True to disable CTLE control
+ABLATE_CTLE = True     # Set to True to disable CTLE control
 
 # ==========================================
 # Evaluation Settings (for evaluate_l2o.py and benchmark_nlms.py)
