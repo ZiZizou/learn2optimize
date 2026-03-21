@@ -191,8 +191,11 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         # Initialize DFE weights
         dfe_weights = torch.zeros(batch_size, dfe.num_taps)
 
-        # Initialize 1-tap FFE (VGA)
-        w_main = torch.ones(batch_size, 1) * FFE_INIT
+        # Initialize Multi-Tap FFE
+        # Initialize w_ffe with center tap = FFE_INIT, all others = 0
+        w_ffe = torch.zeros(batch_size, FFE_TAPS)
+        w_ffe[:, FFE_MAIN_CURSOR] = FFE_INIT
+        ffe_buffer = torch.zeros(batch_size, FFE_TAPS)
 
         # Initialize CTLE latent parameter
         latent_peaking = torch.zeros(batch_size, 1)
@@ -224,7 +227,8 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
             # Detach all state variables at block boundaries
             dfe_weights = dfe_weights.detach()
-            w_main = w_main.detach()
+            w_ffe = w_ffe.detach()
+            ffe_buffer = ffe_buffer.detach()
             latent_peaking = latent_peaking.detach()
             decision_buffer = decision_buffer.detach()
             ema_error = ema_error.detach()
@@ -247,72 +251,133 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                 current_taps = ctle.base_lp.unsqueeze(0) + ctle_peaking * ctle.base_hp.unsqueeze(0)
                 rx_eq = torch.sum(rx_buffer * current_taps, dim=1, keepdim=True)
 
-                # DFE and FFE computation
+                # ============================================================
+                # Multi-Tap FFE with Causality Shift
+                # ============================================================
+                # Shift FFE buffer and insert newest rx_eq at index 0
+                ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=1)
+                ffe_buffer[:, 0] = rx_eq.squeeze(-1)
+
+                # DFE feedback computation
                 dfe_feedback = torch.sum(decision_buffer * dfe_weights, dim=1, keepdim=True)
-                y_out = (w_main * rx_eq) - dfe_feedback
-                e_t = tx_symbols[:, t:t+1] - y_out
 
-                # NLMS Normalization
-                norm_sq = (rx_eq ** 2) + torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
+                # Causality shift: We make decisions for symbol at (t - FFE_MAIN_CURSOR)
+                # Only compute error when we have enough history (target_idx >= 0)
+                target_idx = t - FFE_MAIN_CURSOR
+                can_compute_error = (target_idx >= 0)
 
-                # Gradient proxy for CTLE
-                grad_proxy_ctle = e_t * rx_eq / norm_sq
+                if can_compute_error:
+                    # Compute FFE output (dot product of weights and buffer)
+                    ffe_out = torch.sum(ffe_buffer * w_ffe, dim=1, keepdim=True)
+                    # Total equalizer output
+                    y_out = ffe_out - dfe_feedback
 
-                # Build state features vector
-                state_features = torch.cat([
-                    e_t, ema_error, norm_sq,
-                    dfe_weights[:, 0:1],
-                    ctle_peaking,
-                    grad_proxy_ctle
-                ], dim=1)
+                    target_symbol = tx_symbols[:, target_idx:target_idx + 1]
+                    e_t = target_symbol - y_out
 
-                # ============================================================
-                # Step 2: History Buffer Update
-                # Shift buffer and insert newest state
-                # ============================================================
-                history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
-                history_buffer[:, 0, :] = state_features
+                    # NLMS Normalization (includes full FFE buffer energy)
+                    norm_sq = torch.sum(ffe_buffer ** 2, dim=1, keepdim=True) + \
+                              torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
 
-                # Flatten for MLP input: [batch, history_len * state_dim]
-                flat_history = history_buffer.view(batch_size, -1)
+                    # Gradient proxy for CTLE (use center tap aligned with main cursor)
+                    grad_proxy_ctle = e_t * ffe_buffer[:, FFE_MAIN_CURSOR:FFE_MAIN_CURSOR+1] / norm_sq
 
-                # Forward pass through MLP
-                update_ctle_flag = (t % ctle_update_rate == 0)
-                mu_dfe, mu_ctle = learned_opt(flat_history, update_ctle_flag)
+                    # Build state features vector
+                    state_features = torch.cat([
+                        e_t, ema_error, norm_sq,
+                        dfe_weights[:, 0:1],
+                        ctle_peaking,
+                        grad_proxy_ctle
+                    ], dim=1)
 
-                if ablate_ctle:
-                    mu_ctle = torch.zeros_like(mu_ctle)
+                    # ============================================================
+                    # Step 2: History Buffer Update
+                    # Shift buffer and insert newest state
+                    # ============================================================
+                    history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
+                    history_buffer[:, 0, :] = state_features
 
-                # Update EMA
-                ema_error = ema_beta * ema_error + (1 - ema_beta) * (e_t.detach() ** 2)
+                    # Flatten for MLP input: [batch, history_len * state_dim]
+                    flat_history = history_buffer.view(batch_size, -1)
 
-                # Update DFE weights
-                dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
+                    # Forward pass through MLP
+                    update_ctle_flag = (t % ctle_update_rate == 0)
+                    mu_dfe, mu_ctle = learned_opt(flat_history, update_ctle_flag)
 
-                # Update FFE (w_main)
-                w_main = w_main + (mu_dfe * e_t * rx_eq / norm_sq)
+                    if ablate_ctle:
+                        mu_ctle = torch.zeros_like(mu_ctle)
 
-                # Update CTLE if flag is set
-                if update_ctle_flag:
-                    latent_peaking = latent_peaking + mu_ctle
+                    # Update EMA
+                    ema_error = ema_beta * ema_error + (1 - ema_beta) * (e_t.detach() ** 2)
 
-                # Soft decisions for differentiable meta-training
-                tau = 0.1
-                soft_decision = torch.tanh(y_out / tau)
+                    # Update DFE weights
+                    dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
 
-                decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
-                decision_buffer[:, 0] = soft_decision.squeeze(-1)
+                    # Update Multi-Tap FFE weights
+                    w_ffe = w_ffe + (mu_dfe * e_t * ffe_buffer / norm_sq)
 
-                # Accumulate loss
-                step_mse = torch.mean(e_t ** 2)
-                loss += step_mse
-                epoch_total_mse += step_mse.item()
-                num_steps += 1
-                
-                # Steady-state tracking (after 200 symbols)
-                if t >= 200:
-                    epoch_ss_mse += step_mse.item()
-                    ss_steps += 1
+                    # Update CTLE if flag is set
+                    if update_ctle_flag:
+                        latent_peaking = latent_peaking + mu_ctle
+
+                    # Soft decisions for differentiable meta-training
+                    tau = 0.1
+                    soft_decision = torch.tanh(y_out / tau)
+
+                    decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
+                    decision_buffer[:, 0] = soft_decision.squeeze(-1)
+
+                    # Accumulate loss
+                    step_mse = torch.mean(e_t ** 2)
+                    loss += step_mse
+                    epoch_total_mse += step_mse.item()
+                    num_steps += 1
+
+                    # Steady-state tracking (after 200 symbols)
+                    if t >= 200:
+                        epoch_ss_mse += step_mse.item()
+                        ss_steps += 1
+                else:
+                    # Warmup phase: not enough history for valid error computation
+                    # Still update ffe_buffer to build up history for future steps
+                    # Use zero error placeholder for state (will be ignored)
+                    norm_sq = torch.sum(ffe_buffer ** 2, dim=1, keepdim=True) + \
+                              torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
+                    grad_proxy_ctle = torch.zeros_like(ffe_buffer[:, FFE_MAIN_CURSOR:FFE_MAIN_CURSOR+1])
+
+                    state_features = torch.cat([
+                        torch.zeros_like(ema_error),  # placeholder e_t = 0
+                        ema_error,
+                        norm_sq,
+                        dfe_weights[:, 0:1],
+                        ctle_peaking,
+                        grad_proxy_ctle
+                    ], dim=1)
+
+                    # ============================================================
+                    # History Buffer Update (for warmup too)
+                    # ============================================================
+                    history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
+                    history_buffer[:, 0, :] = state_features
+
+                    # Flatten for MLP input
+                    flat_history = history_buffer.view(batch_size, -1)
+
+                    # Forward pass through MLP
+                    update_ctle_flag = (t % ctle_update_rate == 0)
+                    mu_dfe, mu_ctle = learned_opt(flat_history, update_ctle_flag)
+
+                    if ablate_ctle:
+                        mu_ctle = torch.zeros_like(mu_ctle)
+
+                    # Still update CTLE but with zero error (no learning)
+                    if update_ctle_flag:
+                        latent_peaking = latent_peaking + mu_ctle
+
+                    # Use zero soft decision during warmup to avoid noise buildup
+                    soft_decision = torch.zeros(batch_size, 1)
+                    decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
+                    decision_buffer[:, 0] = soft_decision.squeeze(-1)
 
             # Backward pass and optimizer step
             if loss.requires_grad:

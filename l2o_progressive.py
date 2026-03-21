@@ -249,9 +249,11 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         hidden_state = torch.zeros(batch_size, 32)
         dfe_weights = torch.zeros(batch_size, dfe.num_taps)
 
-        # Prompt 2: Integrate 1-Tap FFE (VGA)
-        # Initialize w_main to FFE_INIT to scale the main cursor amplitude
-        w_main = torch.ones(batch_size, 1) * FFE_INIT
+        # Prompt 2: Integrate Multi-Tap FFE
+        # Initialize w_ffe with center tap = FFE_INIT, all others = 0
+        w_ffe = torch.zeros(batch_size, FFE_TAPS)
+        w_ffe[:, FFE_MAIN_CURSOR] = FFE_INIT
+        ffe_buffer = torch.zeros(batch_size, FFE_TAPS)
 
         # Prompt 4: Unbounded Latent Parameter Projection
         # Use unbounded latent variable, sigmoid to get physical [0,1] gain
@@ -281,7 +283,8 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
             hidden_state = hidden_state.detach()
             dfe_weights = dfe_weights.detach()
-            w_main = w_main.detach()
+            w_ffe = w_ffe.detach()
+            ffe_buffer = ffe_buffer.detach()
             latent_peaking = latent_peaking.detach()
             decision_buffer = decision_buffer.detach()
             ema_error = ema_error.detach()
@@ -308,63 +311,115 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                 # Direct dot product (FIR filtering) - bypass F.conv1d
                 rx_eq = torch.sum(rx_buffer * current_taps, dim=1, keepdim=True)
 
-                # Prompt 2: Integrate 1-Tap FFE (VGA)
-                # y_out = w_main * rx_eq - dfe_feedback
+                # ============================================================
+                # Multi-Tap FFE with Causality Shift
+                # ============================================================
+                # Shift FFE buffer and insert newest rx_eq at index 0
+                ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=1)
+                ffe_buffer[:, 0] = rx_eq.squeeze(-1)
+
+                # DFE feedback computation
                 dfe_feedback = torch.sum(decision_buffer * dfe_weights, dim=1, keepdim=True)
-                y_out = (w_main * rx_eq) - dfe_feedback
-                e_t = tx_symbols[:, t:t+1] - y_out
 
-                # Prompt 2: Corrected NLMS Normalization
-                # Use squared L2 norm including forward signal power
-                norm_sq = (rx_eq ** 2) + torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
-                # Prompt 2: Provide Gradient Context to the State
-                # Calculate differentiable gradient proxy for CTLE
-                grad_proxy_ctle = e_t * rx_eq / norm_sq
+                # Causality shift: We make decisions for symbol at (t - FFE_MAIN_CURSOR)
+                # Only compute error when we have enough history (target_idx >= 0)
+                target_idx = t - FFE_MAIN_CURSOR
+                can_compute_error = (target_idx >= 0)
 
-                state_features = torch.cat([
-                    e_t, ema_error, norm_sq,
-                    dfe_weights[:, 0:1],
-                    ctle_peaking,
-                    grad_proxy_ctle  # Prompt 2: Added CTLE gradient context
-                ], dim=1)
+                if can_compute_error:
+                    # Compute FFE output (dot product of weights and buffer)
+                    ffe_out = torch.sum(ffe_buffer * w_ffe, dim=1, keepdim=True)
+                    # Total equalizer output
+                    y_out = ffe_out - dfe_feedback
 
-                update_ctle_flag = (t % ctle_update_rate == 0)
-                mu_dfe, mu_ctle, hidden_state = learned_opt(state_features, hidden_state, update_ctle_flag)
+                    target_symbol = tx_symbols[:, target_idx:target_idx + 1]
+                    e_t = target_symbol - y_out
 
-                if ablate_ctle:
-                    mu_ctle = torch.zeros_like(mu_ctle)
+                    # ============================================================
+                    # NLMS Normalization (includes full FFE buffer energy)
+                    # ============================================================
+                    norm_sq = torch.sum(ffe_buffer ** 2, dim=1, keepdim=True) + \
+                              torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
 
-                ema_error = ema_beta * ema_error + (1 - ema_beta) * (e_t.detach() ** 2)
+                    # Gradient proxy for CTLE (use center tap aligned with main cursor)
+                    grad_proxy_ctle = e_t * ffe_buffer[:, FFE_MAIN_CURSOR:FFE_MAIN_CURSOR+1] / norm_sq
 
-                # Gradient flow through mu_dfe and mu_ctle (using corrected norm_sq)
-                dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
+                    state_features = torch.cat([
+                        e_t, ema_error, norm_sq,
+                        dfe_weights[:, 0:1],
+                        ctle_peaking,
+                        grad_proxy_ctle
+                    ], dim=1)
 
-                # Prompt 2: Update w_main (1-tap FFE) using same mu_dfe step size
-                # w_main = w_main + (mu_dfe * e_t * rx_eq / norm_sq)
-                w_main = w_main + (mu_dfe * e_t * rx_eq / norm_sq)
+                    update_ctle_flag = (t % ctle_update_rate == 0)
+                    mu_dfe, mu_ctle, hidden_state = learned_opt(state_features, hidden_state, update_ctle_flag)
 
-                if update_ctle_flag:
-                    # Prompt 1: Differentiable Direct Policy for CTLE
-                    # Remove torch.sign() to enable gradient flow; use direct signed delta
-                    latent_peaking = latent_peaking + mu_ctle
+                    if ablate_ctle:
+                        mu_ctle = torch.zeros_like(mu_ctle)
 
-                # Prompt 3: Soft Decisions for Differentiable Meta-Training
-                # Replace hard teacher forcing with differentiable soft-sign
-                tau = 0.1  # Temperature parameter
-                soft_decision = torch.tanh(y_out / tau)
+                    ema_error = ema_beta * ema_error + (1 - ema_beta) * (e_t.detach() ** 2)
 
-                decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
-                decision_buffer[:, 0] = soft_decision.squeeze(-1)
+                    # Gradient flow through mu_dfe and mu_ctle (using corrected norm_sq)
+                    dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
 
-                step_mse = torch.mean(e_t ** 2)
-                loss += step_mse
-                epoch_total_mse += step_mse.item()
-                num_steps += 1
-                
-                # Steady-state tracking (after 200 symbols)
-                if t >= 200:
-                    epoch_ss_mse += step_mse.item()
-                    ss_steps += 1
+                    # ============================================================
+                    # Update Multi-Tap FFE weights
+                    # ============================================================
+                    w_ffe = w_ffe + (mu_dfe * e_t * ffe_buffer / norm_sq)
+
+                    if update_ctle_flag:
+                        # Prompt 1: Differentiable Direct Policy for CTLE
+                        # Remove torch.sign() to enable gradient flow; use direct signed delta
+                        latent_peaking = latent_peaking + mu_ctle
+
+                    # Prompt 3: Soft Decisions for Differentiable Meta-Training
+                    # Replace hard teacher forcing with differentiable soft-sign
+                    tau = 0.1  # Temperature parameter
+                    soft_decision = torch.tanh(y_out / tau)
+
+                    decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
+                    decision_buffer[:, 0] = soft_decision.squeeze(-1)
+
+                    step_mse = torch.mean(e_t ** 2)
+                    loss += step_mse
+                    epoch_total_mse += step_mse.item()
+                    num_steps += 1
+
+                    # Steady-state tracking (after 200 symbols)
+                    if t >= 200:
+                        epoch_ss_mse += step_mse.item()
+                        ss_steps += 1
+                else:
+                    # Warmup phase: not enough history for valid error computation
+                    # Still update ffe_buffer to build up history for future steps
+                    # Use zero error placeholder for state (will be ignored)
+                    norm_sq = torch.sum(ffe_buffer ** 2, dim=1, keepdim=True) + \
+                              torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
+                    grad_proxy_ctle = torch.zeros_like(ffe_buffer[:, FFE_MAIN_CURSOR:FFE_MAIN_CURSOR+1])
+
+                    state_features = torch.cat([
+                        torch.zeros_like(ema_error),  # placeholder e_t = 0
+                        ema_error,
+                        norm_sq,
+                        dfe_weights[:, 0:1],
+                        ctle_peaking,
+                        grad_proxy_ctle
+                    ], dim=1)
+
+                    update_ctle_flag = (t % ctle_update_rate == 0)
+                    mu_dfe, mu_ctle, hidden_state = learned_opt(state_features, hidden_state, update_ctle_flag)
+
+                    if ablate_ctle:
+                        mu_ctle = torch.zeros_like(mu_ctle)
+
+                    # Still update buffers but with zero error (no learning)
+                    if update_ctle_flag:
+                        latent_peaking = latent_peaking + mu_ctle
+
+                    # Use zero soft decision during warmup to avoid noise buildup
+                    soft_decision = torch.zeros(batch_size, 1)
+                    decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
+                    decision_buffer[:, 0] = soft_decision.squeeze(-1)
 
             if loss.requires_grad:
                 (loss / current_block_len).backward()

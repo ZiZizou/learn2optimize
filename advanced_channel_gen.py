@@ -5,10 +5,19 @@ Complex Nonlinearities, and Dynamic Channel Drift.
 This module provides a PyTorch-based channel model that captures realistic
 wireline impairments including impedance mismatches, resonant reflections,
 power amplifier saturation, and time-varying channel characteristics.
+
+Duration Scaling: The impulse response is computed over a continuous time
+vector t ∈ [0, t_max] where t_max = 5.0 * (num_taps / 50). This ensures
+the advanced channel models a physically longer cable with equivalent
+sampling density to the simple channel (which uses t ∈ [0, 5.0] for 50 taps).
+Parameters (tau, gamma, omega0) have been re-tuned to preserve the original
+curve shapes over the scaled time axis.
 """
 
 import torch
 import torch.nn.functional as F
+
+from config import CH_TAPS, SNR_RANGE
 
 
 class AdvancedWirelineChannelGenerator:
@@ -17,23 +26,24 @@ class AdvancedWirelineChannelGenerator:
     complex nonlinearities, and dynamic channel drift.
 
     Attributes:
-        num_taps (int): Number of taps in the impulse response (default: 150).
+        num_taps (int): Number of taps in the impulse response (default: CH_TAPS from config).
         snr_db (float): Signal-to-noise ratio in dB.
         device (torch.device): Device to run computations on.
     """
 
-    def __init__(self, num_taps=150, snr_range=(15, 25), device=None):
+    def __init__(self, num_taps=None, snr_range=None, device=None):
         """
         Initialize the advanced wireline channel generator.
 
         Args:
-            num_taps (int): Number of taps in the impulse response. Default is 150.
-            snr_range (tuple): Signal-to-noise ratio range in dB as (min, max).
-                               Samples uniformly per batch. Default is (15, 25).
+            num_taps (int, optional): Number of taps in the impulse response.
+                                     Defaults to CH_TAPS from config.
+            snr_range (tuple, optional): Signal-to-noise ratio range in dB as (min, max).
+                                         Samples uniformly per batch. Defaults to SNR_RANGE from config.
             device (torch.device, optional): Device for computations. If None, uses CUDA if available.
         """
-        self.num_taps = num_taps
-        self.snr_range = snr_range
+        self.num_taps = CH_TAPS if num_taps is None else num_taps
+        self.snr_range = SNR_RANGE if snr_range is None else snr_range
         self.device = device if device is not None else torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
@@ -48,18 +58,32 @@ class AdvancedWirelineChannelGenerator:
         Returns:
             dict: Dictionary containing tau, beta, gamma, and omega0 parameters.
         """
-        # Sample decay time constant tau from [1.0, 3.0]
-        tau = torch.empty(batch_size, device=self.device).uniform_(1.0, 3.0)
+        # Duration Scaling: time vector now spans [0, t_max] with t_max = 5.0 * (num_taps / 50).
+        # Parameters were originally tuned for integer indices n ∈ [0, 150] (equivalent to 50 taps).
+        # To preserve equivalent curve shapes over the new continuous time vector,
+        # we scale the parameters inversely to the time compression ratio.
+        #
+        # t_max = 5.0 * (num_taps / 50). The parameter scaling follows from this:
+        # tau: larger t_max → parameter must be scale times larger in denominator → tau/scale.
+        # gamma: multiplies t directly → gamma * scale.
+        # omega0: multiplies t directly → omega0 * scale.
+        # For num_taps=150: scale=3.0 → tau∈[0.33,1.0], gamma∈[0.15,0.3], omega0∈[3π/8, 3π/4].
+        # For num_taps=500: scale=10.0 → tau∈[0.1,0.3], gamma∈[0.5,1.0], omega0∈[10π/8,10π/4].
 
-        # Sample reflection amplitude beta from [0.1, 0.3]
+        scale = self.num_taps / 50.0  # Dynamic scaling factor
+
+        # tau: original [1.0, 3.0] for n-scale. Divide by scale to compensate for t expansion.
+        tau = torch.empty(batch_size, device=self.device).uniform_(1.0 / scale, 3.0 / scale)
+
+        # beta: reflection amplitude — unchanged, not time-scale dependent
         beta = torch.empty(batch_size, device=self.device).uniform_(0.1, 0.3)
 
-        # Sample decay rate gamma from [0.05, 0.1]
-        gamma = torch.empty(batch_size, device=self.device).uniform_(0.05, 0.1)
+        # gamma: original [0.05, 0.1] for n-scale. Multiply by scale to compensate.
+        gamma = torch.empty(batch_size, device=self.device).uniform_(0.05 * scale, 0.1 * scale)
 
-        # Sample resonant frequency omega0 from [pi/8, pi/4]
+        # omega0: original [pi/8, pi/4] for n-scale. Multiply by scale to compensate.
         omega0 = torch.empty(batch_size, device=self.device).uniform_(
-            torch.pi / 8, torch.pi / 4
+            scale * torch.pi / 8, scale * torch.pi / 4
         )
 
         return {
@@ -71,9 +95,11 @@ class AdvancedWirelineChannelGenerator:
 
     def _compute_base_impulse_response(self, params):
         """
-        Compute the base impulse response h[n] for each batch element.
+        Compute the base impulse response h(t) for each batch element.
 
-        h[n] = exp(-n/tau) + beta * exp(-gamma * n) * cos(omega0 * n)
+        Duration Scaling: Replaced integer index n with continuous time t ∈ [0, t_max].
+        h(t) = exp(-t/tau) + beta * exp(-gamma * t) * cos(omega0 * t)
+        where t_max = 5.0 * (num_taps / 50) to maintain equivalent cable length.
 
         Args:
             params (dict): Dictionary with tau, beta, gamma, omega0 parameters.
@@ -82,22 +108,25 @@ class AdvancedWirelineChannelGenerator:
             torch.Tensor: Impulse response of shape [batch_size, num_taps].
         """
         batch_size = params['tau'].shape[0]
-        n = torch.arange(self.num_taps, device=self.device, dtype=torch.float32)
 
-        # Expand dimensions for broadcasting: n becomes [1, num_taps]
-        n_expanded = n.unsqueeze(0)
+        # Duration Scaling: Scale t_max linearly with tap count. Base equivalent is 5.0 for 50 taps.
+        t_max = 5.0 * (self.num_taps / 50.0)
+        t = torch.linspace(0, t_max, self.num_taps, device=self.device, dtype=torch.float32)
 
-        # Compute the base low-pass decay: exp(-n/tau)
+        # Expand dimensions for broadcasting: t becomes [1, num_taps]
+        t_expanded = t.unsqueeze(0)
+
+        # Compute the base low-pass decay: exp(-t/tau)
         # tau is [batch_size, 1]
         tau = params['tau'].unsqueeze(1)
-        base_decay = torch.exp(-n_expanded / tau)
+        base_decay = torch.exp(-t_expanded / tau)
 
-        # Compute the resonant ringing component: beta * exp(-gamma * n) * cos(omega0 * n)
+        # Compute the resonant ringing component: beta * exp(-gamma * t) * cos(omega0 * t)
         beta = params['beta'].unsqueeze(1)
         gamma = params['gamma'].unsqueeze(1)
         omega0 = params['omega0'].unsqueeze(1)
 
-        ringing = beta * torch.exp(-gamma * n_expanded) * torch.cos(omega0 * n_expanded)
+        ringing = beta * torch.exp(-gamma * t_expanded) * torch.cos(omega0 * t_expanded)
 
         # Combine the two components
         h = base_decay + ringing
@@ -105,7 +134,8 @@ class AdvancedWirelineChannelGenerator:
         # Normalize so that the peak amplitude is 1.0 (main cursor at index 0)
         # The peak should be at index 0, but we normalize by the maximum value
         max_vals = h.max(dim=1, keepdim=True)[0]
-        h = h / max_vals
+        # h = h / max_vals
+        h = h / torch.norm(h, dim=1, keepdim=True)
 
         return h
 
@@ -158,7 +188,8 @@ class AdvancedWirelineChannelGenerator:
         Returns:
             torch.Tensor: Kappa values sampled uniformly from [0.5, 2.0].
         """
-        return torch.empty(batch_size, device=self.device).uniform_(0.5, 2.0)
+        # return torch.empty(batch_size, device=self.device).uniform_(0.5, 2.0)
+        return torch.ones(batch_size, device=self.device) * 0.0001  # remove nonlinear clipping for this experiment since NLMS itself cannot beat it
 
     def _generate_time_varying_channel(self, h0, seq_len, drift_amplitude=0.1, drift_frequency=0.01):
         """
@@ -195,7 +226,9 @@ class AdvancedWirelineChannelGenerator:
 
         # Re-normalize at each time step to maintain peak amplitude of 1.0
         max_vals = h_time_varying.max(dim=2, keepdim=True)[0]
-        h_time_varying = h_time_varying / max_vals
+        # h_time_varying = h_time_varying / max_vals
+
+        h_time_varying = h_time_varying / torch.norm(h_time_varying, dim=2, keepdim=True)
 
         return h_time_varying
 

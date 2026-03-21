@@ -35,7 +35,10 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
     history_buffer = torch.zeros(batch_size, L2O_MLP_HISTORY_LEN, L2O_STATE_DIM) if model_type == "mlp" else None
 
     dfe_weights = torch.zeros(batch_size, dfe.num_taps)
-    w_main = torch.ones(batch_size, 1) * FFE_INIT
+    # Initialize Multi-Tap FFE
+    w_ffe = torch.zeros(batch_size, FFE_TAPS)
+    w_ffe[:, FFE_MAIN_CURSOR] = FFE_INIT
+    ffe_buffer = torch.zeros(batch_size, FFE_TAPS)
     latent_peaking = torch.zeros(batch_size, 1)
     rx_buffer = torch.zeros(batch_size, ctle.num_taps)
     decision_buffer = torch.zeros(batch_size, dfe.num_taps)
@@ -55,44 +58,95 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
             current_taps = ctle.base_lp.unsqueeze(0) + ctle_peaking * ctle.base_hp.unsqueeze(0)
             rx_eq = torch.sum(rx_buffer * current_taps, dim=1, keepdim=True)
 
+            # ============================================================
+            # Multi-Tap FFE with Causality Shift
+            # ============================================================
+            # Shift FFE buffer and insert newest rx_eq at index 0
+            ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=1)
+            ffe_buffer[:, 0] = rx_eq.squeeze(-1)
+
+            # DFE feedback computation
             dfe_feedback = torch.sum(decision_buffer * dfe_weights, dim=1, keepdim=True)
-            y_out = (w_main * rx_eq) - dfe_feedback
-            e_t = tx_symbols[:, t:t+1] - y_out
 
-            norm_sq = (rx_eq ** 2) + torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
-            grad_proxy_ctle = e_t * rx_eq / norm_sq
+            # Causality shift: We make decisions for symbol at (t - FFE_MAIN_CURSOR)
+            target_idx = t - FFE_MAIN_CURSOR
 
-            state_features = torch.cat([
-                e_t, ema_error, norm_sq,
-                dfe_weights[:, 0:1],
-                ctle_peaking,
-                grad_proxy_ctle
-            ], dim=1)
+            if target_idx >= 0:
+                # Compute FFE output (dot product of weights and buffer)
+                ffe_out = torch.sum(ffe_buffer * w_ffe, dim=1, keepdim=True)
+                # Total equalizer output
+                y_out = ffe_out - dfe_feedback
 
-            if model_type == "mlp":
-                history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
-                history_buffer[:, 0, :] = state_features
-                mu_dfe, mu_ctle = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
+                target_symbol = tx_symbols[:, target_idx:target_idx + 1]
+                e_t = target_symbol - y_out
+
+                norm_sq = torch.sum(ffe_buffer ** 2, dim=1, keepdim=True) + \
+                          torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
+                grad_proxy_ctle = e_t * ffe_buffer[:, FFE_MAIN_CURSOR:FFE_MAIN_CURSOR+1] / norm_sq
+
+                state_features = torch.cat([
+                    e_t, ema_error, norm_sq,
+                    dfe_weights[:, 0:1],
+                    ctle_peaking,
+                    grad_proxy_ctle
+                ], dim=1)
+
+                if model_type == "mlp":
+                    history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
+                    history_buffer[:, 0, :] = state_features
+                    mu_dfe, mu_ctle = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
+                else:
+                    mu_dfe, mu_ctle, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
+
+                # Ablation: Zero out CTLE updates to match training with ABLATE_CTLE=True
+                if ablate_ctle:
+                    mu_ctle = torch.zeros_like(mu_ctle)
+
+                ema_error = 0.95 * ema_error + 0.05 * (e_t ** 2)
+                dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
+                w_ffe = w_ffe + (mu_dfe * e_t * ffe_buffer / norm_sq)
+
+                if t % 10 == 0:
+                    latent_peaking = latent_peaking + mu_ctle
+
+                tau = 0.1
+                decision = torch.tanh(y_out / tau) # Match meta-training distribution
+                decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
+                decision_buffer[:, 0] = decision.squeeze(-1)
+
+                mse_history.append(torch.mean(e_t**2).item())
             else:
-                mu_dfe, mu_ctle, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
+                # Warmup phase: not enough history for valid error computation
+                # Build state features with zero error placeholder
+                norm_sq = torch.sum(ffe_buffer ** 2, dim=1, keepdim=True) + \
+                          torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
+                grad_proxy_ctle = torch.zeros_like(ffe_buffer[:, FFE_MAIN_CURSOR:FFE_MAIN_CURSOR+1])
 
-            # Ablation: Zero out CTLE updates to match training with ABLATE_CTLE=True
-            if ablate_ctle:
-                mu_ctle = torch.zeros_like(mu_ctle)
+                state_features = torch.cat([
+                    torch.zeros_like(ema_error),  # placeholder e_t = 0
+                    ema_error,
+                    norm_sq,
+                    dfe_weights[:, 0:1],
+                    ctle_peaking,
+                    grad_proxy_ctle
+                ], dim=1)
 
-            ema_error = 0.95 * ema_error + 0.05 * (e_t ** 2)
-            dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
-            w_main = w_main + (mu_dfe * e_t * rx_eq / norm_sq)
+                if model_type == "mlp":
+                    history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
+                    history_buffer[:, 0, :] = state_features
+                    mu_dfe, mu_ctle = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
+                else:
+                    mu_dfe, mu_ctle, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
 
-            if t % 10 == 0:
-                latent_peaking = latent_peaking + mu_ctle
+                if ablate_ctle:
+                    mu_ctle = torch.zeros_like(mu_ctle)
 
-            tau = 0.1
-            decision = torch.tanh(y_out / tau) # Match meta-training distribution
-            decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
-            decision_buffer[:, 0] = decision.squeeze(-1)
+                if t % 10 == 0:
+                    latent_peaking = latent_peaking + mu_ctle
 
-            mse_history.append(torch.mean(e_t**2).item())
+                # Use zero decision during warmup
+                decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
+                decision_buffer[:, 0] = 0
 
     return torch.tensor(mse_history)
 

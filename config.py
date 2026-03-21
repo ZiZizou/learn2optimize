@@ -23,7 +23,7 @@ SNR_RANGE = (15, 25)   # dB (signal-to-noise ratio range)
 # ==========================================
 # Equalizer Configuration
 # ==========================================
-DFE_TAPS = 10          # Number of taps in the Decision Feedback Equalizer
+DFE_TAPS = 50          # Number of taps in the Decision Feedback Equalizer
 CTLE_TAPS = 15         # Number of taps in the CTLE FIR approximation
 FIXED_PEAKING = 0.5   # Initial/Fixed CTLE gain for benchmark
 
@@ -33,9 +33,11 @@ FIXED_PEAKING = 0.5   # Initial/Fixed CTLE gain for benchmark
 CTLE_HP_ALPHA = 0.8   # High-pass filter coefficient (0.8 = -6dB at 1/2 Nyquist)
 
 # ==========================================
-# FFE (1-tap VGA) Configuration
+# FFE (Multi-Tap) Configuration
 # ==========================================
-FFE_INIT = 1.0        # Initial value for 1-tap FFE/VGA (w_main)
+FFE_TAPS = 10          # Number of taps in the Feed-Forward Equalizer
+FFE_MAIN_CURSOR = FFE_TAPS // 2  # Index of main cursor (center tap for odd number of taps)
+FFE_INIT = 1.0        # Initial value for FFE/VGA main cursor
 
 # ==========================================
 # RLS Configuration

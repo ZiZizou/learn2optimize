@@ -56,17 +56,17 @@ class DifferentiableCTLE(nn.Module):
         return filtered_rx.view(batch_size, -1)
 
 # ==========================================
-# 3. NLMS Algorithm with 1-Tap FFE
+# 3. NLMS Algorithm with Multi-Tap FFE
 # ==========================================
 def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forcing=True,
                  use_gear_shift=False, mu_fast=0.2, mu_slow=0.01, gear_threshold=0.5, ema_alpha=0.05):
     """
-    NLMS DFE with integrated 1-tap FFE (Variable Gain Amplifier).
+    NLMS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
-    The 1-tap FFE (w_main) scales the main cursor amplitude to match the
-    target +/-1 symbol alphabet before DFE subtraction.
+    The multi-tap FFE spans multiple symbol periods to cancel precursor ISI
+    before the causal DFE handles post-cursor energy.
 
-    Forward: y_t = w_main * rx_signal[t] - w_fb^T * d_fb
+    Forward: y_t = sum(w_ffe[i] * rx_eq[t-i]) - w_fb^T * d_fb
 
     Parameters:
         mu: Static step size (used when use_gear_shift=False)
@@ -78,7 +78,12 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
     """
     seq_len = rx_signal.shape[0]
     weights = torch.zeros(num_taps, dtype=torch.float32)
-    w_main = torch.tensor(FFE_INIT, dtype=torch.float32)  # 1-tap FFE/VGA
+
+    # Initialize Multi-Tap FFE with center tap = FFE_INIT
+    w_ffe = torch.zeros(FFE_TAPS, dtype=torch.float32)
+    w_ffe[FFE_MAIN_CURSOR] = FFE_INIT
+    ffe_buffer = torch.zeros(FFE_TAPS, dtype=torch.float32)
+
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
     mse_log = []
 
@@ -90,41 +95,63 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
         current_mu = mu        # Use static mu
 
     for t in range(seq_len):
-        # Forward pass: w_main * x_t - w_fb^T * d_fb
+        # Shift FFE buffer and insert newest sample at index 0
+        ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=0)
+        ffe_buffer[0] = rx_signal[t]
+
+        # DFE feedback computation
         feedback = torch.dot(decision_buffer, weights)
-        eq_out = w_main * rx_signal[t] - feedback
-        decision = torch.sign(eq_out)
-        e_t = tx_symbols[t] - eq_out
-        mse_log.append((e_t.item())**2)
 
-        # Gear-shifting: Update EMA of squared error
-        if use_gear_shift:
-            ema_error_sq = (1 - ema_alpha) * ema_error_sq + ema_alpha * (e_t.item() ** 2)
+        # Causality shift: target symbol is at t - FFE_MAIN_CURSOR
+        target_idx = t - FFE_MAIN_CURSOR
+        if target_idx >= 0:
+            # Compute FFE output (dot product)
+            ffe_out = torch.dot(w_ffe, ffe_buffer)
+            # Total equalizer output
+            eq_out = ffe_out - feedback
+            decision = torch.sign(eq_out)
+            e_t = tx_symbols[target_idx] - eq_out
+            mse_log.append((e_t.item())**2)
 
-            # Gear-shifting logic
-            if ema_error_sq < gear_threshold:
-                current_mu = mu_slow
+            # Gear-shifting: Update EMA of squared error
+            if use_gear_shift:
+                ema_error_sq = (1 - ema_alpha) * ema_error_sq + ema_alpha * (e_t.item() ** 2)
+
+                # Gear-shifting logic
+                if ema_error_sq < gear_threshold:
+                    current_mu = mu_slow
+                else:
+                    current_mu = mu_fast
+
+            # Normalization includes full FFE buffer energy and feedback buffer
+            norm_sq = torch.dot(ffe_buffer, ffe_buffer) + torch.dot(decision_buffer, decision_buffer) + eps
+
+            # Update feedback weights using current_mu
+            update_step = (current_mu * e_t * decision_buffer) / norm_sq
+            weights = weights - update_step
+
+            # Update Multi-Tap FFE weights
+            update_ffe = (current_mu * e_t * ffe_buffer) / norm_sq
+            w_ffe = w_ffe + update_ffe
+
+            decision_buffer = torch.roll(decision_buffer, shifts=1)
+            if teacher_forcing:
+                decision_buffer[0] = tx_symbols[target_idx]
             else:
-                current_mu = mu_fast
-
-        # Normalization includes both the main tap input and feedback buffer
-        norm_sq = (rx_signal[t] ** 2) + torch.dot(decision_buffer, decision_buffer) + eps
-
-        # Update feedback weights using current_mu
-        update_step = (current_mu * e_t * decision_buffer) / norm_sq
-        weights = weights - update_step
-
-        # Update main tap (1-tap FFE) using current_mu
-        update_main = (current_mu * e_t * rx_signal[t]) / norm_sq
-        w_main = w_main + update_main
-
-        decision_buffer = torch.roll(decision_buffer, shifts=1)
-        if teacher_forcing:
-            decision_buffer[0] = tx_symbols[t]
+                decision_buffer[0] = decision
         else:
-            decision_buffer[0] = decision
+            # Warmup phase: not enough history for valid error computation
+            # Log zero error but still build up ffe_buffer
+            mse_log.append(0.0)
 
-    return torch.tensor(mse_log), weights, w_main
+            # Update feedback weights with zero error (no learning)
+            decision_buffer = torch.roll(decision_buffer, shifts=1)
+            if teacher_forcing:
+                decision_buffer[0] = tx_symbols[t]
+            else:
+                decision_buffer[0] = 0.0
+
+    return torch.tensor(mse_log), weights, w_ffe
 
 
 # ==========================================
@@ -200,72 +227,88 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
 # ==========================================
 
 # ==========================================
-# 3b. RLS Algorithm with 1-Tap FFE
+# 3b. RLS Algorithm with Multi-Tap FFE
 # ==========================================
 def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_forcing=True):
     """
-    RLS DFE with integrated 1-tap FFE (Variable Gain Amplifier).
+    RLS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
-    The RLS system is expanded to order (num_taps + 1):
-    - First element (index 0): w_main (forward gain)
-    - Remaining elements (1 to num_taps): w_fb (feedback taps)
+    The RLS system is expanded to order (FFE_TAPS + num_taps):
+    - First FFE_TAPS elements: w_ffe (forward FFE taps)
+    - Remaining num_taps elements: w_fb (feedback taps)
 
-    Forward: y_t = w_main * x_t - w_fb^T * d_fb
+    Forward: y_t = sum(w_ffe[i] * rx_eq[t-i]) - w_fb^T * d_fb
 
-    The augmented input vector is: u_t = [x_t, d_fb^T]^T
+    The augmented input vector is: u_t = [ffe_buffer, -decision_buffer]^T
     """
     seq_len = rx_signal.shape[0]
-    system_order = num_taps + 1  # 1 main tap + num_taps feedback taps
+    system_order = FFE_TAPS + num_taps  # FFE_TAPS forward + num_taps feedback
 
-    # Initialize weights w_0 = 0, but force first element (main tap) to 1.0
+    # Initialize weights with center tap = 1.0
     weights = torch.zeros(system_order, dtype=torch.float32)
-    weights[0] = 1.0  # Main tap initialized to 1.0
+    weights[FFE_MAIN_CURSOR] = 1.0  # Center tap initialized to 1.0
 
     # Initialize inverse correlation matrix P_0 = delta^(-1) * I
     P = torch.eye(system_order, dtype=torch.float32) / delta
 
-    # Initialize decision buffer (shift register for feedback taps only)
+    # Initialize FFE buffer and decision buffer
+    ffe_buffer = torch.zeros(FFE_TAPS, dtype=torch.float32)
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
 
     mse_log = []
 
     for t in range(seq_len):
-        # 1. Construct augmented input: u_t = [x_t, -decision_buffer]
+        # Shift FFE buffer and insert newest sample at index 0
+        ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=0)
+        ffe_buffer[0] = rx_signal[t]
+
+        # Causality shift: target symbol is at t - FFE_MAIN_CURSOR
+        target_idx = t - FFE_MAIN_CURSOR
+
+        # 1. Construct augmented input: u_t = [ffe_buffer, -decision_buffer]
         # Negate decision buffer so RLS naturally subtracts feedback (aligns with DFE)
-        u_t = torch.cat([rx_signal[t:t+1], -decision_buffer]).unsqueeze(1)  # [num_taps+1, 1]
+        u_t = torch.cat([ffe_buffer, -decision_buffer]).unsqueeze(1)  # [system_order, 1]
 
         # 2. Filter output and error
-        # y_t = w^T * u_t = w_main * x_t + w_fb^T * (-d_fb) = w_main * x_t - w_fb^T * d_fb
         all_feedback = torch.dot(weights, u_t.squeeze())
         eq_out = all_feedback
-        e_t = tx_symbols[t] - eq_out
-        mse_log.append((e_t.item()) ** 2)
 
-        # 3. Compute Kalman Gain vector: k_t = P * u_t / (lambda + u_t^T * P * u_t)
-        P_u = torch.matmul(P, u_t)  # [num_taps+1, 1]
-        u_P_u = torch.matmul(u_t.t(), P_u)  # [1, 1] scalar
+        if target_idx >= 0:
+            e_t = tx_symbols[target_idx] - eq_out
+            mse_log.append((e_t.item()) ** 2)
 
-        # k_t = P * u_t / (lambda + u_t^T * P * u_t)
-        denom = lam + u_P_u.squeeze()
-        k_t = P_u / denom  # [num_taps+1, 1]
+            # 3. Compute Kalman Gain vector: k_t = P * u_t / (lambda + u_t^T * P * u_t)
+            P_u = torch.matmul(P, u_t)  # [system_order, 1]
+            u_P_u = torch.matmul(u_t.t(), P_u)  # [1, 1] scalar
 
-        # 4. Weight Update: w_t = w_{t-1} + k_t * e_t (addition for RLS)
-        weights = weights + (k_t.squeeze() * e_t)
+            # k_t = P * u_t / (lambda + u_t^T * P * u_t)
+            denom = lam + u_P_u.squeeze()
+            k_t = P_u / denom  # [system_order, 1]
 
-        # Force main tap to stay near 1.0 (optional: let it vary, or re-insert constraint)
-        # weights[0] = weights[0]  # Allow w_main to adapt freely
+            # 4. Weight Update: w_t = w_{t-1} + k_t * e_t (addition for RLS)
+            weights = weights + (k_t.squeeze() * e_t)
 
-        # 5. Update Inverse Correlation Matrix: P_t = (P_{t-1} - k_t * u_t^T * P_{t-1}) / lambda
-        k_u_t = torch.matmul(k_t, u_t.t())  # [num_taps+1, num_taps+1]
-        P = (P - torch.matmul(k_u_t, P)) / lam
+            # 5. Update Inverse Correlation Matrix: P_t = (P_{t-1} - k_t * u_t^T * P_{t-1}) / lambda
+            k_u_t = torch.matmul(k_t, u_t.t())  # [system_order, system_order]
+            P = (P - torch.matmul(k_u_t, P)) / lam
 
-        # 6. Make decision and update shift register
-        decision = torch.sign(eq_out)
-        decision_buffer = torch.roll(decision_buffer, shifts=1)
-        if teacher_forcing:
-            decision_buffer[0] = tx_symbols[t]
+            # 6. Make decision and update shift register
+            decision = torch.sign(eq_out)
+            decision_buffer = torch.roll(decision_buffer, shifts=1)
+            if teacher_forcing:
+                decision_buffer[0] = tx_symbols[target_idx]
+            else:
+                decision_buffer[0] = decision
         else:
-            decision_buffer[0] = decision
+            # Warmup phase: not enough history for valid error computation
+            mse_log.append(0.0)
+
+            # Update shift register with current symbol but no weight update
+            decision_buffer = torch.roll(decision_buffer, shifts=1)
+            if teacher_forcing:
+                decision_buffer[0] = tx_symbols[t]
+            else:
+                decision_buffer[0] = 0.0
 
     return torch.tensor(mse_log), weights
 
