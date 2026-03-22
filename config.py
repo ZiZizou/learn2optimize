@@ -74,6 +74,12 @@ GEAR_SHIFT_MU_SLOW = 0.01     # Tracking gear step size
 GEAR_SHIFT_THRESHOLD = 0.5    # MSE threshold to trigger gear shift
 GEAR_SHIFT_EMA_ALPHA = 0.05   # Smoothing factor for error variance
 
+# Continuous Variable Step-Size (VSS) NLMS parameters
+VSS_MU_MAX = 0.05       # Upper bound (fast acquisition)
+VSS_MU_MIN = 0.005     # Lower bound (fine tracking/steady-state)
+VSS_ALPHA = 0.99       # Memory factor (close to 1 for smooth decay)
+VSS_GAMMA = 1e-3      # Error scaling factor (controls reaction to error spikes)
+
 # Benchmark settings
 BURN_IN = 2000          # Symbols to skip for steady-state calculation
 TARGET_MSE_DB = -20     # Target MSE in dB

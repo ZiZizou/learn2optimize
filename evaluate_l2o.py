@@ -166,6 +166,29 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to a specific trained model file. If not provided, "
                              "auto-generates paths based on channel_type and ablation settings.")
+    # Strategy selection flags (default all to True for backward compatibility)
+    parser.add_argument("--include_l2o", action="store_true", default=True,
+                        help="Include L2O models in evaluation (default: True)")
+    parser.add_argument("--no_l2o", action="store_true",
+                        help="Exclude all L2O models from evaluation")
+    parser.add_argument("--no_rnn_basic", action="store_true",
+                        help="Exclude RNN Basic model")
+    parser.add_argument("--no_mlp", action="store_true",
+                        help="Exclude MLP model")
+    parser.add_argument("--no_rnn_progressive", action="store_true",
+                        help="Exclude RNN Progressive model")
+    parser.add_argument("--include_nlms", action="store_true", default=True,
+                        help="Include static NLMS benchmark (default: True)")
+    parser.add_argument("--no_nlms", action="store_true",
+                        help="Exclude static NLMS benchmark")
+    parser.add_argument("--include_vss", action="store_true", default=True,
+                        help="Include VSS NLMS benchmark (default: True)")
+    parser.add_argument("--no_vss", action="store_true",
+                        help="Exclude VSS NLMS benchmark")
+    parser.add_argument("--include_rls", action="store_true", default=True,
+                        help="Include RLS benchmark (default: True)")
+    parser.add_argument("--no_rls", action="store_true",
+                        help="Exclude RLS benchmark")
     parser = add_channel_args(parser)
     args = parser.parse_args()
 
@@ -175,6 +198,20 @@ if __name__ == "__main__":
     ctle_peaking = args.ctle_peaking
     ablate_ctle = args.ablate_ctle
     model_path = args.model_path
+
+    # Process strategy selection flags
+    include_l2o = args.include_l2o and not args.no_l2o
+    include_nlms = args.include_nlms and not args.no_nlms
+    include_vss = args.include_vss and not args.no_vss
+    include_rls = args.include_rls and not args.no_rls
+
+    # L2O model exclusion flags
+    exclude_rnn_basic = args.no_rnn_basic
+    exclude_mlp = args.no_mlp
+    exclude_rnn_progressive = args.no_rnn_progressive
+
+    print(f"Strategy selection: L2O={include_l2o}, NLMS={include_nlms}, VSS={include_vss}, RLS={include_rls}")
+    print(f"L2O exclusions: RNN_Basic={exclude_rnn_basic}, MLP={exclude_mlp}, RNN_Progressive={exclude_rnn_progressive}")
 
     # Use config values only if they meet minimum thresholds; otherwise use defaults
     DEFAULT_SEQ_LEN = 500
@@ -234,54 +271,72 @@ if __name__ == "__main__":
         ]
     else:
         # Auto-generate paths based on channel_type and ablation settings
-        models_to_test = [
+        all_models = [
             (f"RNN Basic{ablate_label}", f"./models/l2o_basic_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32)),
             (f"MLP{ablate_label}", f"./models/l2o_mlp_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "mlp", MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM)),
             (f"RNN Progressive{ablate_label}", f"./models/l2o_progressive_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32))
         ]
+        # Filter based on exclusion flags
+        models_to_test = []
+        for name, path, mtype, model in all_models:
+            excluded = False
+            if "RNN Basic" in name and exclude_rnn_basic:
+                excluded = True
+            if "MLP" in name and exclude_mlp:
+                excluded = True
+            if "RNN Progressive" in name and exclude_rnn_progressive:
+                excluded = True
+            if not excluded:
+                models_to_test.append((name, path, mtype, model))
 
     plt.figure(figsize=(12, 7))
 
-    for name, path, mtype, model in models_to_test:
-        try:
-            model.load_state_dict(torch.load(path))
-            print(f"Loaded {name} from {path}")
-            mse_trace = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
-            avg_mse = torch.mean(mse_trace).item()
-            ss_mse = torch.mean(mse_trace[burn_in:]).item()
-            results[name] = (avg_mse, ss_mse)
+    # 1. Evaluate L2O Models (if enabled)
+    if include_l2o:
+        for name, path, mtype, model in models_to_test:
+            try:
+                model.load_state_dict(torch.load(path))
+                print(f"Loaded {name} from {path}")
+                mse_trace = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
+                avg_mse = torch.mean(mse_trace).item()
+                ss_mse = torch.mean(mse_trace[burn_in:]).item()
+                results[name] = (avg_mse, ss_mse)
 
-            smoothed = pd.Series(mse_trace).ewm(span=20).mean()
-            plt.plot(10 * torch.log10(torch.tensor(smoothed)), label=f"{name} (SS: {10*np.log10(ss_mse):.2f} dB)")
-        except FileNotFoundError:
-            print(f"Skipping {name}: weight file not found.")
+                smoothed = pd.Series(mse_trace).ewm(span=20).mean()
+                plt.plot(10 * torch.log10(torch.tensor(smoothed)), label=f"{name} (SS: {10*np.log10(ss_mse):.2f} dB)")
+            except FileNotFoundError:
+                print(f"Skipping {name}: weight file not found.")
 
     # 2. Run Benchmarks on the SAME batch data (fair comparison)
-    # NLMS Bench (using batch wrapper)
-    avg_mse_nlms, _ = run_batch_nlms_dfe(
-        rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False  # Matched to L2O head scale
-    )
-    results["NLMS (0.05)"] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item())
-    smoothed_nlms = pd.Series(avg_mse_nlms.numpy()).ewm(span=20).mean()
-    plt.plot(10 * torch.log10(torch.tensor(smoothed_nlms)), '--', label="NLMS mu=0.05", alpha=0.6)
 
-    # Gear-Shift NLMS Bench
-    avg_mse_gs, _ = run_batch_nlms_dfe(
-        rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False,
-        use_gear_shift=True, mu_fast=GEAR_SHIFT_MU_FAST, mu_slow=GEAR_SHIFT_MU_SLOW,
-        gear_threshold=GEAR_SHIFT_THRESHOLD, ema_alpha=GEAR_SHIFT_EMA_ALPHA
-    )
-    results["NLMS (Gear-Shift)"] = (torch.mean(avg_mse_gs).item(), torch.mean(avg_mse_gs[burn_in:]).item())
-    smoothed_gs = pd.Series(avg_mse_gs.numpy()).ewm(span=20).mean()
-    plt.plot(10 * torch.log10(torch.tensor(smoothed_gs)), '--', label="NLMS Gear-Shift", alpha=0.6)
+    # Static NLMS Bench (if enabled)
+    if include_nlms:
+        avg_mse_nlms, _ = run_batch_nlms_dfe(
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False
+        )
+        results["NLMS (0.05)"] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item())
+        smoothed_nlms = pd.Series(avg_mse_nlms.numpy()).ewm(span=20).mean()
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_nlms)), '--', label="NLMS mu=0.05", alpha=0.6)
 
-    # RLS Bench (using batch wrapper)
-    avg_mse_rls, _ = run_batch_rls_dfe(
-        rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=False
-    )
-    results["RLS"] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item())
-    smoothed_rls = pd.Series(avg_mse_rls.numpy()).ewm(span=20).mean()
-    plt.plot(10 * torch.log10(torch.tensor(smoothed_rls)), 'k:', label="RLS Baseline", linewidth=2)
+    # VSS NLMS Bench (if enabled)
+    if include_vss:
+        avg_mse_vss, _ = run_batch_nlms_dfe(
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
+            use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
+            vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA
+        )
+        results["NLMS (VSS)"] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item())
+        smoothed_vss = pd.Series(avg_mse_vss.numpy()).ewm(span=20).mean()
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_vss)), '--', label="NLMS Continuous VSS", alpha=0.6)
+
+    # RLS Bench (if enabled)
+    if include_rls:
+        avg_mse_rls, _ = run_batch_rls_dfe(
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=False
+        )
+        results["RLS"] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item())
+        smoothed_rls = pd.Series(avg_mse_rls.numpy()).ewm(span=20).mean()
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_rls)), 'k:', label="RLS Baseline", linewidth=2)
 
     # Final Reporting
     print("\nComparison Table (Evaluation on {} symbols, batch-avg):".format(seq_len))

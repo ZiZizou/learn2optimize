@@ -59,7 +59,7 @@ class DifferentiableCTLE(nn.Module):
 # 3. NLMS Algorithm with Multi-Tap FFE
 # ==========================================
 def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forcing=True,
-                 use_gear_shift=False, mu_fast=0.2, mu_slow=0.01, gear_threshold=0.5, ema_alpha=0.05):
+                 use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3):
     """
     NLMS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -69,12 +69,12 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
     Forward: y_t = sum(w_ffe[i] * rx_eq[t-i]) - w_fb^T * d_fb
 
     Parameters:
-        mu: Static step size (used when use_gear_shift=False)
-        use_gear_shift: If True, enable variable step-size (gear-shifting)
-        mu_fast: Acquisition gear step size (default: 0.2)
-        mu_slow: Tracking gear step size (default: 0.01)
-        gear_threshold: MSE threshold to trigger gear shift (default: 0.5)
-        ema_alpha: Smoothing factor for error variance (default: 0.05)
+        mu: Static step size (used when use_vss=False)
+        use_vss: If True, enable continuous variable step-size (VSS)
+        vss_mu_max: Upper bound for VSS (fast acquisition, default: 0.1)
+        vss_mu_min: Lower bound for VSS (fine tracking, default: 0.005)
+        vss_alpha: Memory factor for VSS (default: 0.99, close to 1 for smooth decay)
+        vss_gamma: Error scaling factor for VSS (default: 1e-3)
     """
     seq_len = rx_signal.shape[0]
     weights = torch.zeros(num_taps, dtype=torch.float32)
@@ -87,10 +87,9 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
     mse_log = []
 
-    # Step size selection: static or gear-shifting
-    if use_gear_shift:
-        current_mu = mu_fast  # Start with fast acquisition
-        ema_error_sq = 1.0    # Start high to prevent premature shifting
+    # Step size selection: static or continuous VSS
+    if use_vss:
+        current_mu = vss_mu_max  # Start fast for rapid acquisition
     else:
         current_mu = mu        # Use static mu
 
@@ -113,15 +112,10 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             e_t = tx_symbols[target_idx] - eq_out
             mse_log.append((e_t.item())**2)
 
-            # Gear-shifting: Update EMA of squared error
-            if use_gear_shift:
-                ema_error_sq = (1 - ema_alpha) * ema_error_sq + ema_alpha * (e_t.item() ** 2)
-
-                # Gear-shifting logic
-                if ema_error_sq < gear_threshold:
-                    current_mu = mu_slow
-                else:
-                    current_mu = mu_fast
+            # Continuous Variable Step-Size (VSS) Update
+            if use_vss:
+                current_mu = (vss_alpha * current_mu) + (vss_gamma * (e_t.item() ** 2))
+                current_mu = max(vss_mu_min, min(vss_mu_max, current_mu))
 
             # Normalization includes full FFE buffer energy and feedback buffer
             norm_sq = torch.dot(ffe_buffer, ffe_buffer) + torch.dot(decision_buffer, decision_buffer) + eps
@@ -316,7 +310,7 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
 # 3c. Batch NLMS Wrapper
 # ==========================================
 def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_forcing=False,
-                       use_gear_shift=False, mu_fast=0.2, mu_slow=0.01, gear_threshold=0.5, ema_alpha=0.05):
+                       use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3):
     """
     Wrapper to run NLMS DFE over a batch of channels.
 
@@ -337,8 +331,8 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
 
         mse_history, weights, w_main = run_nlms_dfe(
             rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
-            use_gear_shift=use_gear_shift, mu_fast=mu_fast, mu_slow=mu_slow,
-            gear_threshold=gear_threshold, ema_alpha=ema_alpha
+            use_vss=use_vss, vss_mu_max=vss_mu_max, vss_mu_min=vss_mu_min,
+            vss_alpha=vss_alpha, vss_gamma=vss_gamma
         )
         mse_histories.append(mse_history)
 
