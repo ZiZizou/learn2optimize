@@ -94,9 +94,9 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
                 if model_type == "mlp":
                     history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
                     history_buffer[:, 0, :] = state_features
-                    mu_dfe, mu_ctle = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
+                    mu_dfe, mu_ctle, _ = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
                 else:
-                    mu_dfe, mu_ctle, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
+                    mu_dfe, mu_ctle, _, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
 
                 # Ablation: Zero out CTLE updates to match training with ABLATE_CTLE=True
                 if ablate_ctle:
@@ -134,9 +134,9 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
                 if model_type == "mlp":
                     history_buffer = torch.roll(history_buffer, shifts=1, dims=1)
                     history_buffer[:, 0, :] = state_features
-                    mu_dfe, mu_ctle = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
+                    mu_dfe, mu_ctle, _ = model(history_buffer.view(batch_size, -1), update_ctle=(t % 10 == 0))
                 else:
-                    mu_dfe, mu_ctle, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
+                    mu_dfe, mu_ctle, _, hidden_state = model(state_features, hidden_state, update_ctle=(t % 10 == 0))
 
                 if ablate_ctle:
                     mu_ctle = torch.zeros_like(mu_ctle)
@@ -148,7 +148,7 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
                 decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
                 decision_buffer[:, 0] = 0
 
-    return torch.tensor(mse_history)
+    return torch.tensor(mse_history), w_ffe, dfe_weights
 
 if __name__ == "__main__":
     # Parse command-line arguments (fall back to config defaults)
@@ -163,6 +163,8 @@ if __name__ == "__main__":
                         help=f"CTLE peaking gain (default: {FIXED_CTLE_PEAKING})")
     parser.add_argument("--ablate_ctle", action="store_true",
                         help="Enable ablation mode for models trained with ABLATE_CTLE=True")
+    parser.add_argument("--two_head", action="store_true",
+                        help="Evaluate models trained with two-head overdrive architecture")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to a specific trained model file. If not provided, "
                              "auto-generates paths based on channel_type and ablation settings.")
@@ -189,6 +191,8 @@ if __name__ == "__main__":
                         help="Include RLS benchmark (default: True)")
     parser.add_argument("--no_rls", action="store_true",
                         help="Exclude RLS benchmark")
+    parser.add_argument("--no_baseline", action="store_true",
+                        help="Exclude all baseline algorithms (NLMS, VSS, RLS)")
     parser = add_channel_args(parser)
     args = parser.parse_args()
 
@@ -201,9 +205,9 @@ if __name__ == "__main__":
 
     # Process strategy selection flags
     include_l2o = args.include_l2o and not args.no_l2o
-    include_nlms = args.include_nlms and not args.no_nlms
-    include_vss = args.include_vss and not args.no_vss
-    include_rls = args.include_rls and not args.no_rls
+    include_nlms = args.include_nlms and not args.no_nlms and not args.no_baseline
+    include_vss = args.include_vss and not args.no_vss and not args.no_baseline
+    include_rls = args.include_rls and not args.no_rls and not args.no_baseline
 
     # L2O model exclusion flags
     exclude_rnn_basic = args.no_rnn_basic
@@ -253,6 +257,9 @@ if __name__ == "__main__":
     print("-" * 60)
 
     results = {}
+    # Store weights per channel per method: weights[method][channel_idx] = (ffe_taps, dfe_taps)
+    all_ffe_weights = {}  # method -> list of FFE arrays
+    all_dfe_weights = {}  # method -> list of DFE arrays
 
     # 1. Evaluate L2O Models
     # If model_path is provided, use it for a single model; otherwise auto-generate paths
@@ -266,15 +273,17 @@ if __name__ == "__main__":
             model_type = "mlp"
         models_to_test = [
             (f"Custom Model{ablate_label}", model_path, model_type,
-             MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM) if model_type == "mlp"
-             else MultiRateLearnedNLMS(6, 32))
+             MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=args.two_head) if model_type == "mlp"
+             else MultiRateLearnedNLMS(6, 32, use_two_head=args.two_head))
         ]
     else:
         # Auto-generate paths based on channel_type and ablation settings
+        two_head_suffix = "_two_head" if args.two_head else ""
+        two_head_label = " (Two-Head)" if args.two_head else ""
         all_models = [
-            (f"RNN Basic{ablate_label}", f"./models/l2o_basic_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32)),
-            (f"MLP{ablate_label}", f"./models/l2o_mlp_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "mlp", MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM)),
-            (f"RNN Progressive{ablate_label}", f"./models/l2o_progressive_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32))
+            (f"RNN Basic{ablate_label}{two_head_label}", f"./models/l2o_basic_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32, use_two_head=args.two_head)),
+            (f"MLP{ablate_label}{two_head_label}", f"./models/l2o_mlp_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth", "mlp", MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=args.two_head)),
+            (f"RNN Progressive{ablate_label}{two_head_label}", f"./models/l2o_progressive_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32, use_two_head=args.two_head))
         ]
         # Filter based on exclusion flags
         models_to_test = []
@@ -297,10 +306,13 @@ if __name__ == "__main__":
             try:
                 model.load_state_dict(torch.load(path))
                 print(f"Loaded {name} from {path}")
-                mse_trace = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
+                mse_trace, w_ffe_final, dfe_final = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
                 avg_mse = torch.mean(mse_trace).item()
                 ss_mse = torch.mean(mse_trace[burn_in:]).item()
                 results[name] = (avg_mse, ss_mse)
+                # Store all channel weights (not averaged)
+                all_ffe_weights[name] = [w_ffe_final[i].cpu().numpy() for i in range(batch_size)]
+                all_dfe_weights[name] = [dfe_final[i].cpu().numpy() for i in range(batch_size)]
 
                 smoothed = pd.Series(mse_trace).ewm(span=20).mean()
                 plt.plot(10 * torch.log10(torch.tensor(smoothed)), label=f"{name} (SS: {10*np.log10(ss_mse):.2f} dB)")
@@ -311,30 +323,49 @@ if __name__ == "__main__":
 
     # Static NLMS Bench (if enabled)
     if include_nlms:
-        avg_mse_nlms, _ = run_batch_nlms_dfe(
+        avg_mse_nlms, nlms_all_dfe, nlms_all_ffe = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False
         )
         results["NLMS (0.05)"] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item())
+        all_ffe_weights["NLMS (0.05)"] = nlms_all_ffe
+        all_dfe_weights["NLMS (0.05)"] = nlms_all_dfe
         smoothed_nlms = pd.Series(avg_mse_nlms.numpy()).ewm(span=20).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_nlms)), '--', label="NLMS mu=0.05", alpha=0.6)
 
     # VSS NLMS Bench (if enabled)
     if include_vss:
-        avg_mse_vss, _ = run_batch_nlms_dfe(
+        avg_mse_vss, vss_all_dfe, vss_all_ffe = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
             use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
             vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA
         )
         results["NLMS (VSS)"] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item())
+        all_ffe_weights["NLMS (VSS)"] = vss_all_ffe
+        all_dfe_weights["NLMS (VSS)"] = vss_all_dfe
         smoothed_vss = pd.Series(avg_mse_vss.numpy()).ewm(span=20).mean()
-        plt.plot(10 * torch.log10(torch.tensor(smoothed_vss)), '--', label="NLMS Continuous VSS", alpha=0.6)
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_vss)), 'b--', label="NLMS Continuous VSS", alpha=0.6)
+
+        # VSS NLMS with Momentum Bench (if enabled)
+        avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe = run_batch_nlms_dfe(
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
+            use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
+            vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM
+        )
+        results["NLMS (VSS+Mom)"] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item())
+        all_ffe_weights["NLMS (VSS+Mom)"] = vss_mom_all_ffe
+        all_dfe_weights["NLMS (VSS+Mom)"] = vss_mom_all_dfe
+        smoothed_vss_mom = pd.Series(avg_mse_vss_mom.numpy()).ewm(span=20).mean()
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_vss_mom)), 'm:', label=f"NLMS Continuous VSS (Mom={VSS_MOMENTUM})", alpha=0.6)
 
     # RLS Bench (if enabled)
     if include_rls:
-        avg_mse_rls, _ = run_batch_rls_dfe(
+        avg_mse_rls, rls_all_combined = run_batch_rls_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=False
         )
         results["RLS"] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item())
+        # RLS combines FFE and DFE into one weight vector [FFE_TAPS + DFE_TAPS]
+        all_ffe_weights["RLS"] = [w[:FFE_TAPS] for w in rls_all_combined]
+        all_dfe_weights["RLS"] = [w[FFE_TAPS:] for w in rls_all_combined]
         smoothed_rls = pd.Series(avg_mse_rls.numpy()).ewm(span=20).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_rls)), 'k:', label="RLS Baseline", linewidth=2)
 
@@ -345,10 +376,80 @@ if __name__ == "__main__":
     for name, (avg, ss) in results.items():
         print(f"{name:<20} | {10*np.log10(avg):>12.2f} dB | {10*np.log10(ss):>12.2f} dB")
 
-    plt.axhline(y=-20, color='r', linestyle='--', label='Target -20dB')
+    # Print final FFE and DFE taps for each method (show 2-3 example channels)
+    print("\nFinal Equalizer Taps (2-3 example channels):")
+    print("=" * 80)
+    num_example_channels = min(3, batch_size)
+
+    for ch_idx in range(num_example_channels):
+        print(f"\n--- Channel {ch_idx} ---")
+        for name in results.keys():
+            # Check if this method has weights for this channel
+            if ch_idx < len(all_ffe_weights[name]):
+                ffe_taps = all_ffe_weights[name][ch_idx]
+                dfe_taps = all_dfe_weights[name][ch_idx]
+                print(f"  {name}:")
+                print(f"    FFE: {ffe_taps}")
+                print(f"    DFE: {dfe_taps}")
+            else:
+                print(f"  {name}: N/A (benchmark only has 1 channel)")
+
     plt.title(f"Inference Comparison: Learned Optimizers vs Benchmarks\n(Evaluated on {seq_len} symbols, CH={CH_TAPS}, DFE={DFE_TAPS})")
     plt.xlabel("Symbols")
     plt.ylabel("MSE (dB)")
     plt.legend()
     plt.grid(True)
     plt.show()
+
+    # Bar plots - separate plots for each channel
+    if all_ffe_weights and all_dfe_weights:
+        methods = list(all_ffe_weights.keys())
+        num_methods = len(methods)
+        colors = [plt.cm.tab10.colors[i] for i in range(num_methods)]
+
+        # Create separate figure for each example channel
+        for ch_idx in range(num_example_channels):
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            fig.suptitle(f'Channel {ch_idx} - Final Equalizer Tap Weights', fontsize=14, fontweight='bold')
+
+            # Determine which methods have data for this channel
+            available_methods = [(i, m) for i, m in enumerate(methods) if ch_idx < len(all_ffe_weights[m])]
+
+            if not available_methods:
+                plt.close(fig)
+                continue
+
+            # FFE taps bar plot for this channel
+            ax1 = axes[0]
+            x = np.arange(FFE_TAPS)
+            width = 0.8 / float(len(available_methods))
+            for i, (orig_idx, method) in enumerate(available_methods):
+                ffe_taps = all_ffe_weights[method][ch_idx]
+                ax1.bar(x + i * width, ffe_taps, width, label=method, color=colors[orig_idx], alpha=0.8)
+            ax1.set_xlabel('Tap Index')
+            ax1.set_ylabel('Weight Value')
+            ax1.set_title(f'FFE Taps ({FFE_TAPS} taps)')
+            ax1.set_xticks(x + width * (len(available_methods) - 1) / 2)
+            ax1.set_xticklabels(x)
+            ax1.legend()
+            ax1.grid(True, axis='y', alpha=0.3)
+            ax1.axhline(y=0, color='black', linewidth=0.5)
+
+            # DFE taps bar plot for this channel
+            ax2 = axes[1]
+            x = np.arange(DFE_TAPS)
+            width = 0.8 / float(len(available_methods))
+            for i, (orig_idx, method) in enumerate(available_methods):
+                dfe_taps = all_dfe_weights[method][ch_idx]
+                ax2.bar(x + i * width, dfe_taps, width, label=method, color=colors[orig_idx], alpha=0.8)
+            ax2.set_xlabel('Tap Index')
+            ax2.set_ylabel('Weight Value')
+            ax2.set_title(f'DFE Taps ({DFE_TAPS} taps)')
+            ax2.set_xticks(x + width * (len(available_methods) - 1) / 2)
+            ax2.set_xticklabels(x)
+            ax2.legend()
+            ax2.grid(True, axis='y', alpha=0.3)
+            ax2.axhline(y=0, color='black', linewidth=0.5)
+
+            plt.tight_layout()
+            plt.show()

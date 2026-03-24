@@ -23,7 +23,7 @@ SNR_RANGE = (15, 25)   # dB (signal-to-noise ratio range)
 # ==========================================
 # Equalizer Configuration
 # ==========================================
-DFE_TAPS = 50          # Number of taps in the Decision Feedback Equalizer
+DFE_TAPS = 10          # Number of taps in the Decision Feedback Equalizer
 CTLE_TAPS = 15         # Number of taps in the CTLE FIR approximation
 FIXED_PEAKING = 0.5   # Initial/Fixed CTLE gain for benchmark
 
@@ -68,17 +68,19 @@ UNROLL_DELTA = 10      # Increment step size for unroll length
 # ==========================================
 NLMS_MU_VALUES = [0.01, 0.05, 0.1, 0.2]  # Static mu sweep values
 
-# Gear-shifting (Variable Step-Size) NLMS parameters
-GEAR_SHIFT_MU_FAST = 0.2       # Acquisition gear step size
-GEAR_SHIFT_MU_SLOW = 0.01     # Tracking gear step size
-GEAR_SHIFT_THRESHOLD = 0.5    # MSE threshold to trigger gear shift
-GEAR_SHIFT_EMA_ALPHA = 0.05   # Smoothing factor for error variance
+# DEPRECATED: Gear-shifting (Variable Step-Size) NLMS parameters
+# These parameters are no longer used - we use continuous VSS NLMS instead
+# GEAR_SHIFT_MU_FAST = 0.2       # Acquisition gear step size
+# GEAR_SHIFT_MU_SLOW = 0.01     # Tracking gear step size
+# GEAR_SHIFT_THRESHOLD = 0.5    # MSE threshold to trigger gear shift
+# GEAR_SHIFT_EMA_ALPHA = 0.05   # Smoothing factor for error variance
 
 # Continuous Variable Step-Size (VSS) NLMS parameters
-VSS_MU_MAX = 0.05       # Upper bound (fast acquisition)
+VSS_MU_MAX = 0.1       # Upper bound (fast acquisition)
 VSS_MU_MIN = 0.005     # Lower bound (fine tracking/steady-state)
 VSS_ALPHA = 0.99       # Memory factor (close to 1 for smooth decay)
 VSS_GAMMA = 1e-3      # Error scaling factor (controls reaction to error spikes)
+VSS_MOMENTUM = 0.9     # Momentum coefficient for heavy-ball optimization (0.0 = no momentum)
 
 # Benchmark settings
 BURN_IN = 2000          # Symbols to skip for steady-state calculation
@@ -90,6 +92,7 @@ TARGET_MSE_DB = -20     # Target MSE in dB
 L2O_HIDDEN_DIM = 32     # Hidden dimension for GRU/RNN cell
 L2O_STATE_DIM = 6       # State features dimension
 L2O_DFE_HEAD_SCALE = 0.05    # DFE step size bound
+L2O_OVERDRIVE_MAX = 0.4
 L2O_CTLE_HEAD_SCALE = 0.05   # CTLE step size bound
 L2O_META_LR = 1e-3     # Meta-optimizer learning rate
 CTLE_UPDATE_RATE = 10   # Update CTLE every N symbols

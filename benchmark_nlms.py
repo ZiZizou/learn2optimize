@@ -59,7 +59,8 @@ class DifferentiableCTLE(nn.Module):
 # 3. NLMS Algorithm with Multi-Tap FFE
 # ==========================================
 def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forcing=True,
-                 use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3):
+                 use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
+                 vss_momentum=0.0):
     """
     NLMS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -75,6 +76,8 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
         vss_mu_min: Lower bound for VSS (fine tracking, default: 0.005)
         vss_alpha: Memory factor for VSS (default: 0.99, close to 1 for smooth decay)
         vss_gamma: Error scaling factor for VSS (default: 1e-3)
+        vss_momentum: Momentum coefficient for heavy-ball optimization (default: 0.0, no momentum)
+                      Typical values: 0.9 or 0.95 for momentum-enabled updates
     """
     seq_len = rx_signal.shape[0]
     weights = torch.zeros(num_taps, dtype=torch.float32)
@@ -86,6 +89,10 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
 
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
     mse_log = []
+
+    # Initialize momentum buffers for heavy-ball optimization
+    dfe_momentum_buffer = torch.zeros(num_taps, dtype=torch.float32)
+    ffe_momentum_buffer = torch.zeros(FFE_TAPS, dtype=torch.float32)
 
     # Step size selection: static or continuous VSS
     if use_vss:
@@ -120,13 +127,18 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             # Normalization includes full FFE buffer energy and feedback buffer
             norm_sq = torch.dot(ffe_buffer, ffe_buffer) + torch.dot(decision_buffer, decision_buffer) + eps
 
-            # Update feedback weights using current_mu
-            update_step = (current_mu * e_t * decision_buffer) / norm_sq
-            weights = weights - update_step
+            # Calculate instantaneous gradients scaled by current_mu
+            inst_grad_dfe = (current_mu * e_t * decision_buffer) / norm_sq
+            inst_grad_ffe = (current_mu * e_t * ffe_buffer) / norm_sq
 
-            # Update Multi-Tap FFE weights
-            update_ffe = (current_mu * e_t * ffe_buffer) / norm_sq
-            w_ffe = w_ffe + update_ffe
+            # Update momentum buffers (Heavy-ball momentum)
+            dfe_momentum_buffer = (vss_momentum * dfe_momentum_buffer) + inst_grad_dfe
+            ffe_momentum_buffer = (vss_momentum * ffe_momentum_buffer) + inst_grad_ffe
+
+            # Apply updates to weights using momentum
+            # DFE subtracts feedback, FFE adds it (standard DFE math)
+            weights = weights - dfe_momentum_buffer
+            w_ffe = w_ffe + ffe_momentum_buffer
 
             decision_buffer = torch.roll(decision_buffer, shifts=1)
             if teacher_forcing:
@@ -310,7 +322,8 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
 # 3c. Batch NLMS Wrapper
 # ==========================================
 def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_forcing=False,
-                       use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3):
+                       use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
+                       vss_momentum=0.0):
     """
     Wrapper to run NLMS DFE over a batch of channels.
 
@@ -320,10 +333,13 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
 
     Output:
         avg_mse_history: Averaged MSE across batch dimension [seq_len]
-        final_weights: Final DFE weights from last channel [num_taps]
+        all_dfe_weights: List of final DFE weights per channel [batch_size, num_taps]
+        all_ffe_weights: List of final FFE weights per channel [batch_size, FFE_TAPS]
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
+    all_dfe_weights = []
+    all_ffe_weights = []
 
     for i in range(batch_size):
         rx_i = rx_batch[i]  # [seq_len]
@@ -332,15 +348,17 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
         mse_history, weights, w_main = run_nlms_dfe(
             rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
             use_vss=use_vss, vss_mu_max=vss_mu_max, vss_mu_min=vss_mu_min,
-            vss_alpha=vss_alpha, vss_gamma=vss_gamma
+            vss_alpha=vss_alpha, vss_gamma=vss_gamma, vss_momentum=vss_momentum
         )
         mse_histories.append(mse_history)
+        all_dfe_weights.append(weights.cpu().numpy())
+        all_ffe_weights.append(w_main.cpu().numpy())
 
     # Stack and average across batch
     mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
     avg_mse_history = torch.mean(mse_stacked, dim=0)   # [seq_len]
 
-    return avg_mse_history, weights
+    return avg_mse_history, all_dfe_weights, all_ffe_weights
 
 
 # ==========================================
@@ -356,10 +374,11 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
 
     Output:
         avg_mse_history: Averaged MSE across batch dimension [seq_len]
-        final_weights: Final DFE weights from last channel [num_taps + 1]
+        final_weights: Final combined weights (FFE + DFE) from last channel [FFE_TAPS + num_taps]
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
+    all_combined_weights = []
 
     for i in range(batch_size):
         rx_i = rx_batch[i]  # [seq_len]
@@ -369,12 +388,13 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
             rx_i, tx_i, num_taps=num_taps, lam=lam, delta=delta, teacher_forcing=teacher_forcing
         )
         mse_histories.append(mse_history)
+        all_combined_weights.append(weights.cpu().numpy())
 
     # Stack and average across batch
     mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
     avg_mse_history = torch.mean(mse_stacked, dim=0)  # [seq_len]
 
-    return avg_mse_history, weights
+    return avg_mse_history, all_combined_weights
 
 
 # ==========================================
@@ -498,32 +518,34 @@ if __name__ == "__main__":
         smoothed_mse = pd.Series(avg_mse_history.numpy()).ewm(span=200).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_mse)), label=f'NLMS (mu={mu_val})')
 
-    # 4b. Run Gear-Shifting NLMS (Variable Step-Size) - using batch wrapper
-    avg_mse_history_gs, final_w_gs = run_batch_nlms_dfe(
-        rx_aligned, tx_aligned, num_taps=DFE_TAPS,
-        mu=0.1,  # Base mu (used when use_gear_shift=False)
-        teacher_forcing=False,
-        use_gear_shift=True,  # Enable gear-shifting
-        mu_fast=GEAR_SHIFT_MU_FAST,
-        mu_slow=GEAR_SHIFT_MU_SLOW,
-        gear_threshold=GEAR_SHIFT_THRESHOLD,
-        ema_alpha=GEAR_SHIFT_EMA_ALPHA
-    )
-
-    # Acquisition vs Steady-State for Gear-Shift
-    acq_mse_gs = torch.mean(avg_mse_history_gs[:500]).item()
-    acq_mse_gs_db = 10 * torch.log10(torch.tensor(acq_mse_gs)).item()
-    ss_mse_gs = torch.mean(avg_mse_history_gs[BURN_IN:]).item()
-    ss_mse_gs_db = 10 * torch.log10(torch.tensor(ss_mse_gs)).item()
-
-    print(f"{'NLMS Gear-Shift':<25} | {acq_mse_gs_db:>7.2f} dB | {ss_mse_gs_db:>10.2f} dB")
-
-    smoothed_mse_gs = pd.Series(avg_mse_history_gs.numpy()).ewm(span=200).mean()
-    plt.plot(
-        10 * torch.log10(torch.tensor(smoothed_mse_gs)),
-        color='purple', linewidth=2,
-        label=f'NLMS Gear-Shift (mu_fast={GEAR_SHIFT_MU_FAST}, mu_slow={GEAR_SHIFT_MU_SLOW})'
-    )
+    # DEPRECATED: 4b. Run Gear-Shifting NLMS (Variable Step-Size) - using batch wrapper
+    # This code is deprecated - we use continuous VSS NLMS instead of discrete gear-shifting
+    # The function call below had incorrect parameters that don't exist in run_batch_nlms_dfe
+    # avg_mse_history_gs, final_w_gs = run_batch_nlms_dfe(
+    #     rx_aligned, tx_aligned, num_taps=DFE_TAPS,
+    #     mu=0.1,  # Base mu (used when use_gear_shift=False)
+    #     teacher_forcing=False,
+    #     use_gear_shift=True,  # Enable gear-shifting
+    #     mu_fast=GEAR_SHIFT_MU_FAST,
+    #     mu_slow=GEAR_SHIFT_MU_SLOW,
+    #     gear_threshold=GEAR_SHIFT_THRESHOLD,
+    #     ema_alpha=GEAR_SHIFT_EMA_ALPHA
+    # )
+    #
+    # # Acquisition vs Steady-State for Gear-Shift
+    # acq_mse_gs = torch.mean(avg_mse_history_gs[:500]).item()
+    # acq_mse_gs_db = 10 * torch.log10(torch.tensor(acq_mse_gs)).item()
+    # ss_mse_gs = torch.mean(avg_mse_history_gs[BURN_IN:]).item()
+    # ss_mse_gs_db = 10 * torch.log10(torch.tensor(ss_mse_gs)).item()
+    #
+    # print(f"{'NLMS Gear-Shift':<25} | {acq_mse_gs_db:>7.2f} dB | {ss_mse_gs_db:>10.2f} dB")
+    #
+    # smoothed_mse_gs = pd.Series(avg_mse_history_gs.numpy()).ewm(span=200).mean()
+    # plt.plot(
+    #     10 * torch.log10(torch.tensor(smoothed_mse_gs)),
+    #     color='purple', linewidth=2,
+    #     label=f'NLMS Gear-Shift (mu_fast={GEAR_SHIFT_MU_FAST}, mu_slow={GEAR_SHIFT_MU_SLOW})'
+    # )
 
     # 5. Run RLS DFE (optimal linear upper bound) - using batch wrapper
     avg_mse_history_rls, final_w_rls = run_batch_rls_dfe(
@@ -548,7 +570,7 @@ if __name__ == "__main__":
     )
 
     plt.axhline(y=-20, color='r', linestyle='--', label='Target MSE (-20 dB)')
-    plt.title(f'NLMS vs Gear-Shift vs RLS Baseline (CH={CH_TAPS}, DFE={DFE_TAPS})')
+    plt.title(f'NLMS vs VSS vs RLS Baseline (CH={CH_TAPS}, DFE={DFE_TAPS})')
     plt.xlabel('Symbols')
     plt.ylabel('MSE (dB)')
     plt.legend()

@@ -120,21 +120,38 @@ class DifferentiableDFE(nn.Module):
 # 2. Multi-Rate Learned Optimizer
 # ==========================================
 class MultiRateLearnedNLMS(nn.Module):
-    def __init__(self, state_dim=5, hidden_dim=32):
+    def __init__(self, state_dim=5, hidden_dim=32, use_two_head=False):
         super().__init__()
         # State: [e_t, EMA_t, norm(X), current_mu_dfe, current_peaking]
         self.rnn = nn.GRUCell(state_dim, hidden_dim)
+        self.use_two_head = use_two_head
 
-        # Separate heads for DFE step size and CTLE step size
-        self.head_dfe = nn.Linear(hidden_dim, 1)
+        # Base head: always used, tightly bounded [0, 0.05]
+        self.head_dfe_base = nn.Linear(hidden_dim, 1)
+
+        # Overdrive head: only instantiated if two_head is True
+        if self.use_two_head:
+            self.head_dfe_overdrive = nn.Linear(hidden_dim, 1)
+
         self.head_ctle = nn.Linear(hidden_dim, 1)
 
     def forward(self, state_features, hidden_state, update_ctle=False):
         hidden_state = self.rnn(state_features, hidden_state)
 
-        # Prompt 3: Bound Initial L2O Step Sizes
-        # Reduce upper bound from 0.5 to 0.05 to prevent early-epoch instability
-        mu_dfe = torch.sigmoid(self.head_dfe(hidden_state)) * L2O_DFE_HEAD_SCALE
+        # 1. Base Step Size: tightly bounded between (0, 0.05) using sigmoid
+        mu_base = torch.sigmoid(self.head_dfe_base(hidden_state)) * L2O_DFE_HEAD_SCALE
+
+        # 2. Overdrive Step Size
+        if self.use_two_head:
+            # Softplus allows smooth gradients near zero.
+            # Clamp to 0.45 so max theoretical combined speed is 0.5 (safe physical limit)
+            raw_overdrive = F.softplus(self.head_dfe_overdrive(hidden_state))
+            mu_overdrive = torch.clamp(raw_overdrive, max=L2O_OVERDRIVE_MAX)
+        else:
+            # Return zero tensor if overdrive is disabled
+            mu_overdrive = torch.zeros_like(mu_base)
+
+        mu_dfe = mu_base + mu_overdrive
 
         if update_ctle:
             # CTLE step size is typically smaller to prevent instability
@@ -142,7 +159,8 @@ class MultiRateLearnedNLMS(nn.Module):
         else:
             mu_ctle = torch.zeros_like(mu_dfe)
 
-        return mu_dfe, mu_ctle, hidden_state
+        # RETURN mu_overdrive so we can regularize it in the training loop
+        return mu_dfe, mu_ctle, mu_overdrive, hidden_state
 
 
 # ==========================================
@@ -352,7 +370,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     ], dim=1)
 
                     update_ctle_flag = (t % ctle_update_rate == 0)
-                    mu_dfe, mu_ctle, hidden_state = learned_opt(state_features, hidden_state, update_ctle_flag)
+                    mu_dfe, mu_ctle, mu_overdrive, hidden_state = learned_opt(state_features, hidden_state, update_ctle_flag)
 
                     if ablate_ctle:
                         mu_ctle = torch.zeros_like(mu_ctle)
@@ -382,6 +400,12 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
                     step_mse = torch.mean(e_t ** 2)
                     loss += step_mse
+
+                    # OVERDRIVE PENALTY: Heavily penalize the network for using the overdrive head
+                    # This forces mu_overdrive to collapse to 0 during steady-state tracking
+                    if learned_opt.use_two_head:
+                        loss += 0.01 * torch.mean(mu_overdrive ** 2)
+
                     epoch_total_mse += step_mse.item()
                     num_steps += 1
 
@@ -407,7 +431,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     ], dim=1)
 
                     update_ctle_flag = (t % ctle_update_rate == 0)
-                    mu_dfe, mu_ctle, hidden_state = learned_opt(state_features, hidden_state, update_ctle_flag)
+                    mu_dfe, mu_ctle, mu_overdrive, hidden_state = learned_opt(state_features, hidden_state, update_ctle_flag)
 
                     if ablate_ctle:
                         mu_ctle = torch.zeros_like(mu_ctle)
@@ -451,6 +475,8 @@ if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Train Learned Optimizer (Progressive)")
     parser = add_channel_args(parser)
+    parser.add_argument("--two_head", action="store_true",
+                        help="Enable the two-head overdrive architecture for DFE step size")
     args = parser.parse_args()
 
     # Instantiate modules
@@ -458,7 +484,7 @@ if __name__ == "__main__":
     channel_gen = get_channel_generator(args)
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
-    learned_opt = MultiRateLearnedNLMS(state_dim=6, hidden_dim=32)
+    learned_opt = MultiRateLearnedNLMS(state_dim=6, hidden_dim=32, use_two_head=args.two_head)
 
     print(f"Channel type: {args.channel_type}")
     print(f"Channel taps: {CH_TAPS}")
@@ -470,6 +496,7 @@ if __name__ == "__main__":
     print(f"  - Initial unroll: {INITIAL_UNROLL}")
     print(f"  - Max unroll: {MAX_UNROLL}")
     print(f"  - Step epoch: {UNROLL_STEP_EPOCH}")
+    print(f"Two-head overdrive enabled: {args.two_head}")
     print("-" * 50)
 
     # Train the learned optimizer
@@ -506,7 +533,8 @@ if __name__ == "__main__":
     
     # Save the trained model
     suffix = "_ablate_ctle" if ABLATE_CTLE else ""
-    model_path = f"./models/l2o_progressive_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth"
+    two_head_suffix = "_two_head" if args.two_head else ""
+    model_path = f"./models/l2o_progressive_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth"
     torch.save(trained_model.state_dict(), model_path)
     print(f"Trained model saved to {model_path}")
     print("-" * 50)
@@ -536,4 +564,4 @@ if __name__ == "__main__":
 # Your proposed learned optimizer (L2O) replaces rigid DSP mathematics with a parameterized, non-linear memory cell .
 #     State Variables: The neural network's hidden state (ht​) via a GRU, supplemented by engineered momentum features like the Exponential Moving Average (EMA) of the error.
 #     Mechanism: Instead of memorizing input covariance like RLS, the GRU learns what temporal features are useful to remember. It tracks the trajectory of the error surface over time. If the sequence of past gradients indicates the weights are far from convergence, the hidden state retains this momentum and outputs a large step size (μt​).
-#     Mathematical Implication: This allows the optimizer to exhibit "gear shifting" —taking large steps early when uncertainty is high, and small steps late when the EMA error stabilizes. It approximates the convergence benefits of second-order memory without the O(N2) matrix inversion penalty.
+#     Mathematical Implication: This allows the optimizer to exhibit adaptive step-sizing behavior — taking larger steps early when uncertainty is high, and smaller steps as the error stabilizes. It approximates the convergence benefits of second-order memory without the O(N2) matrix inversion penalty.

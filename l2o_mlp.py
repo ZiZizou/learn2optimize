@@ -86,11 +86,17 @@ class MultiRateLearnedMLP(nn.Module):
     - This allows direct gradient flow without BPTT through the RNN recurrence.
     - The history buffer acts as an "explicit memory" that the MLP can
       learn to interpret.
+
+    Two-Head Overdrive Architecture:
+    - Base head (sigmoid bounded): For steady-state tracking, mu in [0, 0.05]
+    - Overdrive head (softplus + clamp): For acquisition, additional mu in [0, 0.45]
+    - Total max mu = 0.5 (physical stability limit for NLMS)
     """
-    def __init__(self, state_dim=6, history_len=10, hidden_dim=64):
+    def __init__(self, state_dim=6, history_len=10, hidden_dim=64, use_two_head=False):
         super().__init__()
         self.state_dim = state_dim
         self.history_len = history_len
+        self.use_two_head = use_two_head
         input_dim = state_dim * history_len
 
         # Deep feedforward network to handle increased input dimensionality
@@ -101,8 +107,13 @@ class MultiRateLearnedMLP(nn.Module):
             nn.ReLU()
         )
 
-        # Separate heads for DFE step size and CTLE step size
-        self.head_dfe = nn.Linear(hidden_dim, 1)
+        # Base head: always used, tightly bounded [0, 0.05]
+        self.head_dfe_base = nn.Linear(hidden_dim, 1)
+
+        # Overdrive head: only instantiated if two_head is True
+        if self.use_two_head:
+            self.head_dfe_overdrive = nn.Linear(hidden_dim, 1)
+
         self.head_ctle = nn.Linear(hidden_dim, 1)
 
     def forward(self, history_buffer, update_ctle=False):
@@ -114,18 +125,32 @@ class MultiRateLearnedMLP(nn.Module):
         Returns:
             mu_dfe: [batch_size, 1] - DFE step size
             mu_ctle: [batch_size, 1] - CTLE step size
+            mu_overdrive: [batch_size, 1] - Overdrive component (for regularization)
         """
         features = self.mlp(history_buffer)
 
-        # Bound step sizes exactly as in l2o_basic.py
-        mu_dfe = torch.sigmoid(self.head_dfe(features)) * L2O_DFE_HEAD_SCALE
+        # 1. Base Step Size: tightly bounded between (0, 0.05) using sigmoid
+        mu_base = torch.sigmoid(self.head_dfe_base(features)) * L2O_DFE_HEAD_SCALE
+
+        # 2. Overdrive Step Size
+        if self.use_two_head:
+            # Softplus allows smooth gradients near zero.
+            # Clamp to 0.45 so max theoretical combined speed is 0.5 (safe physical limit)
+            raw_overdrive = F.softplus(self.head_dfe_overdrive(features))
+            mu_overdrive = torch.clamp(raw_overdrive, max=L2O_OVERDRIVE_MAX)
+        else:
+            # Return zero tensor if overdrive is disabled
+            mu_overdrive = torch.zeros_like(mu_base)
+
+        mu_dfe = mu_base + mu_overdrive
 
         if update_ctle:
             mu_ctle = torch.tanh(self.head_ctle(features)) * L2O_CTLE_HEAD_SCALE
         else:
             mu_ctle = torch.zeros_like(mu_dfe)
 
-        return mu_dfe, mu_ctle
+        # RETURN mu_overdrive so we can regularize it in the training loop
+        return mu_dfe, mu_ctle, mu_overdrive
 
 
 # ==========================================
@@ -302,7 +327,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
                     # Forward pass through MLP
                     update_ctle_flag = (t % ctle_update_rate == 0)
-                    mu_dfe, mu_ctle = learned_opt(flat_history, update_ctle_flag)
+                    mu_dfe, mu_ctle, mu_overdrive = learned_opt(flat_history, update_ctle_flag)
 
                     if ablate_ctle:
                         mu_ctle = torch.zeros_like(mu_ctle)
@@ -330,6 +355,12 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     # Accumulate loss
                     step_mse = torch.mean(e_t ** 2)
                     loss += step_mse
+
+                    # OVERDRIVE PENALTY: Heavily penalize the network for using the overdrive head
+                    # This forces mu_overdrive to collapse to 0 during steady-state tracking
+                    if learned_opt.use_two_head:
+                        loss += 0.01 * torch.mean(mu_overdrive ** 2)
+
                     epoch_total_mse += step_mse.item()
                     num_steps += 1
 
@@ -365,7 +396,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
                     # Forward pass through MLP
                     update_ctle_flag = (t % ctle_update_rate == 0)
-                    mu_dfe, mu_ctle = learned_opt(flat_history, update_ctle_flag)
+                    mu_dfe, mu_ctle, mu_overdrive = learned_opt(flat_history, update_ctle_flag)
 
                     if ablate_ctle:
                         mu_ctle = torch.zeros_like(mu_ctle)
@@ -408,6 +439,8 @@ if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Train Learned Optimizer (MLP)")
     parser = add_channel_args(parser)
+    parser.add_argument("--two_head", action="store_true",
+                        help="Enable the two-head overdrive architecture for DFE step size")
     args = parser.parse_args()
 
     # Instantiate modules
@@ -420,7 +453,8 @@ if __name__ == "__main__":
     learned_opt = MultiRateLearnedMLP(
         state_dim=L2O_STATE_DIM,
         history_len=L2O_MLP_HISTORY_LEN,
-        hidden_dim=L2O_MLP_HIDDEN_DIM
+        hidden_dim=L2O_MLP_HIDDEN_DIM,
+        use_two_head=args.two_head
     )
 
     print(f"Channel type: {args.channel_type}")
@@ -432,6 +466,7 @@ if __name__ == "__main__":
     print(f"Unroll length (TBPTT): {UNROLL_LEN}")
     print(f"MLP history length: {L2O_MLP_HISTORY_LEN}")
     print(f"MLP hidden dimension: {L2O_MLP_HIDDEN_DIM}")
+    print(f"Two-head overdrive enabled: {args.two_head}")
     print("-" * 50)
 
     # Train the learned optimizer
@@ -465,7 +500,8 @@ if __name__ == "__main__":
     
     # Save the trained model
     suffix = "_ablate_ctle" if ABLATE_CTLE else ""
-    model_path = f"./models/l2o_mlp_model_{args.channel_type}{suffix}_dfe={DFE_TAPS}.pth"
+    two_head_suffix = "_two_head" if args.two_head else ""
+    model_path = f"./models/l2o_mlp_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth"
     torch.save(trained_model.state_dict(), model_path)
     print(f"Trained model saved to {model_path}")
     print("-" * 50)
