@@ -12,6 +12,7 @@ from l2o_basic import MultiRateLearnedNLMS, DifferentiableCTLE, DifferentiableDF
 from l2o_mlp import MultiRateLearnedMLP
 from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe
 from utils import add_channel_args, get_channel_generator
+from ctle_utils import apply_serdespy_ctle
 
 def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100, seq_len=500, ctle_peaking=0.5, ablate_ctle=False):
     """
@@ -25,7 +26,11 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
     rx_base, _ = channel_gen.generate_received_signal(tx_symbols, batch_size)
 
     with torch.no_grad():
-        rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
+        if ablate_ctle:
+            # Use continuous-time serdespy CTLE (Static LTI pre-filtering)
+            rx_init = apply_serdespy_ctle(rx_base, peaking_gain=ctle_peaking)
+        else:
+            rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
         batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
 
     common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
@@ -49,14 +54,22 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
     with torch.no_grad():
         effective_len = seq_len - common_delay
         for t in range(effective_len):
-            rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
-            ctle_peaking = torch.sigmoid(latent_peaking)
+            if ablate_ctle:
+                # O(1) fetch from pre-computed continuous-time waveform
+                # The CTLE was already applied as a static LTI pre-filter
+                rx_eq = rx_init[:, (t + common_delay):(t + common_delay + 1)]
 
-            rx_buffer = torch.roll(rx_buffer, shifts=1, dims=1)
-            rx_buffer[:, 0] = rx_t.squeeze(-1)
+                # CTLE is static; use fixed peaking gain
+                ctle_peaking = torch.tensor(0.5, device=latent_peaking.device)
+            else:
+                rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
+                ctle_peaking = torch.sigmoid(latent_peaking)
 
-            current_taps = ctle.base_lp.unsqueeze(0) + ctle_peaking * ctle.base_hp.unsqueeze(0)
-            rx_eq = torch.sum(rx_buffer * current_taps, dim=1, keepdim=True)
+                rx_buffer = torch.roll(rx_buffer, shifts=1, dims=1)
+                rx_buffer[:, 0] = rx_t.squeeze(-1)
+
+                current_taps = ctle.base_lp.unsqueeze(0) + ctle_peaking * ctle.base_hp.unsqueeze(0)
+                rx_eq = torch.sum(rx_buffer * current_taps, dim=1, keepdim=True)
 
             # ============================================================
             # Multi-Tap FFE with Causality Shift
@@ -242,7 +255,12 @@ if __name__ == "__main__":
     # Generate batch data once - will be reused for both L2O and baseline evaluation
     tx_symbols = torch.sign(torch.randn(batch_size, seq_len))
     rx_base, _ = gen.generate_received_signal(tx_symbols, batch_size)
-    rx_init = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
+
+    if ablate_ctle:
+        print("Applying continuous-time SerDesPy CTLE for evaluation...")
+        rx_init = apply_serdespy_ctle(rx_base, peaking_gain=ctle_peaking)
+    else:
+        rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
     # Synchronize using cross-correlation to find common delay
     batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
