@@ -10,6 +10,7 @@ from config import *
 # Import architectures from training scripts
 from l2o_basic import MultiRateLearnedNLMS, DifferentiableCTLE, DifferentiableDFE, cross_correlate_sync_batch
 from l2o_mlp import MultiRateLearnedMLP
+from l2o_mlp_no_agc import MultiRateLearnedMLPNoAGC
 from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe
 from utils import add_channel_args, get_channel_generator
 from ctle_utils import apply_serdespy_ctle
@@ -50,6 +51,7 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
     ema_error = torch.ones(batch_size, 1)
 
     mse_history = []
+    mu_history = []  # Track step sizes for analysis
 
     with torch.no_grad():
         effective_len = seq_len - common_delay
@@ -60,7 +62,8 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
                 rx_eq = rx_init[:, (t + common_delay):(t + common_delay + 1)]
 
                 # CTLE is static; use fixed peaking gain
-                ctle_peaking = torch.tensor(0.5, device=latent_peaking.device)
+                # Must be [batch_size, 1] to match tensor shapes in torch.cat
+                ctle_peaking = torch.full((batch_size, 1), 0.5, device=latent_peaking.device)
             else:
                 rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
                 ctle_peaking = torch.sigmoid(latent_peaking)
@@ -128,6 +131,7 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
                 decision_buffer[:, 0] = decision.squeeze(-1)
 
                 mse_history.append(torch.mean(e_t**2).item())
+                mu_history.append(torch.mean(mu_dfe).item())
             else:
                 # Warmup phase: not enough history for valid error computation
                 # Build state features with zero error placeholder
@@ -161,7 +165,7 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
                 decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
                 decision_buffer[:, 0] = 0
 
-    return torch.tensor(mse_history), w_ffe, dfe_weights
+    return torch.tensor(mse_history), w_ffe, dfe_weights, torch.tensor(mu_history)
 
 if __name__ == "__main__":
     # Parse command-line arguments (fall back to config defaults)
@@ -243,6 +247,8 @@ if __name__ == "__main__":
     print("Starting Comparative Evaluation (Inference Mode)...")
     print(f"Settings: batch_size={batch_size}, seq_len={seq_len}, burn_in={burn_in}")
     print(f"Channel type: {args.channel_type}")
+    if args.disable_agc:
+        print("*** NO-AGC MODE: Channel normalization disabled - evaluating with raw physics-preserved voltages ***")
     if ablate_ctle:
         print("*** ABLATION MODE: CTLE updates disabled (matching ABLATE_CTLE=True training) ***")
     print("-" * 60)
@@ -278,6 +284,7 @@ if __name__ == "__main__":
     # Store weights per channel per method: weights[method][channel_idx] = (ffe_taps, dfe_taps)
     all_ffe_weights = {}  # method -> list of FFE arrays
     all_dfe_weights = {}  # method -> list of DFE arrays
+    step_size_history = {}  # method -> tensor of step sizes over time
 
     # 1. Evaluate L2O Models
     # If model_path is provided, use it for a single model; otherwise auto-generate paths
@@ -289,18 +296,35 @@ if __name__ == "__main__":
         model_type = "rnn"  # Default, user should specify if MLP
         if "mlp" in model_path.lower():
             model_type = "mlp"
+        # Check if this is a no-AGC model
+        is_no_agc_model = "_no_agc" in model_path.lower()
+        # Auto-detect two-head from model filename
+        is_two_head_model = "_two_head" in model_path.lower()
+        if is_no_agc_model:
+            mlp_class = MultiRateLearnedMLPNoAGC
+        else:
+            mlp_class = MultiRateLearnedMLP
         models_to_test = [
             (f"Custom Model{ablate_label}", model_path, model_type,
-             MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=args.two_head) if model_type == "mlp"
-             else MultiRateLearnedNLMS(6, 32, use_two_head=args.two_head))
+             mlp_class(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=is_two_head_model) if model_type == "mlp"
+             else MultiRateLearnedNLMS(6, 32, use_two_head=is_two_head_model))
         ]
     else:
         # Auto-generate paths based on channel_type and ablation settings
         two_head_suffix = "_two_head" if args.two_head else ""
         two_head_label = " (Two-Head)" if args.two_head else ""
+        no_agc_suffix = "_no_agc" if args.disable_agc else ""
+        no_agc_label = " (No AGC)" if args.disable_agc else ""
+
+        # For MLP models, select the appropriate class based on disable_agc flag
+        if args.disable_agc:
+            mlp_class = MultiRateLearnedMLPNoAGC
+        else:
+            mlp_class = MultiRateLearnedMLP
+
         all_models = [
             (f"RNN Basic{ablate_label}{two_head_label}", f"./models/l2o_basic_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32, use_two_head=args.two_head)),
-            (f"MLP{ablate_label}{two_head_label}", f"./models/l2o_mlp_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth", "mlp", MultiRateLearnedMLP(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=args.two_head)),
+            (f"MLP{ablate_label}{two_head_label}{no_agc_label}", f"./models/l2o_mlp_model_{args.channel_type}{suffix}{two_head_suffix}{no_agc_suffix}_dfe={DFE_TAPS}.pth", "mlp", mlp_class(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=args.two_head)),
             (f"RNN Progressive{ablate_label}{two_head_label}", f"./models/l2o_progressive_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth", "rnn", MultiRateLearnedNLMS(6, 32, use_two_head=args.two_head))
         ]
         # Filter based on exclusion flags
@@ -324,10 +348,12 @@ if __name__ == "__main__":
             try:
                 model.load_state_dict(torch.load(path))
                 print(f"Loaded {name} from {path}")
-                mse_trace, w_ffe_final, dfe_final = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
+                mse_trace, w_ffe_final, dfe_final, mu_trace = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
                 avg_mse = torch.mean(mse_trace).item()
                 ss_mse = torch.mean(mse_trace[burn_in:]).item()
+                ss_mu = torch.mean(mu_trace[burn_in:]).item() if len(mu_trace) > burn_in else torch.mean(mu_trace).item()
                 results[name] = (avg_mse, ss_mse)
+                step_size_history[name] = mu_trace
                 # Store all channel weights (not averaged)
                 all_ffe_weights[name] = [w_ffe_final[i].cpu().numpy() for i in range(batch_size)]
                 all_dfe_weights[name] = [dfe_final[i].cpu().numpy() for i in range(batch_size)]
@@ -341,18 +367,19 @@ if __name__ == "__main__":
 
     # Static NLMS Bench (if enabled)
     if include_nlms:
-        avg_mse_nlms, nlms_all_dfe, nlms_all_ffe = run_batch_nlms_dfe(
+        avg_mse_nlms, nlms_all_dfe, nlms_all_ffe, mu_nlms = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False
         )
         results["NLMS (0.05)"] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item())
         all_ffe_weights["NLMS (0.05)"] = nlms_all_ffe
         all_dfe_weights["NLMS (0.05)"] = nlms_all_dfe
+        step_size_history["NLMS (0.05)"] = mu_nlms  # Static mu=0.05
         smoothed_nlms = pd.Series(avg_mse_nlms.numpy()).ewm(span=20).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_nlms)), '--', label="NLMS mu=0.05", alpha=0.6)
 
     # VSS NLMS Bench (if enabled)
     if include_vss:
-        avg_mse_vss, vss_all_dfe, vss_all_ffe = run_batch_nlms_dfe(
+        avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
             use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
             vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA
@@ -360,11 +387,12 @@ if __name__ == "__main__":
         results["NLMS (VSS)"] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item())
         all_ffe_weights["NLMS (VSS)"] = vss_all_ffe
         all_dfe_weights["NLMS (VSS)"] = vss_all_dfe
+        step_size_history["NLMS (VSS)"] = mu_vss
         smoothed_vss = pd.Series(avg_mse_vss.numpy()).ewm(span=20).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_vss)), 'b--', label="NLMS Continuous VSS", alpha=0.6)
 
         # VSS NLMS with Momentum Bench (if enabled)
-        avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe = run_batch_nlms_dfe(
+        avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe, mu_vss_mom = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
             use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
             vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM
@@ -372,6 +400,7 @@ if __name__ == "__main__":
         results["NLMS (VSS+Mom)"] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item())
         all_ffe_weights["NLMS (VSS+Mom)"] = vss_mom_all_ffe
         all_dfe_weights["NLMS (VSS+Mom)"] = vss_mom_all_dfe
+        step_size_history["NLMS (VSS+Mom)"] = mu_vss_mom
         smoothed_vss_mom = pd.Series(avg_mse_vss_mom.numpy()).ewm(span=20).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_vss_mom)), 'm:', label=f"NLMS Continuous VSS (Mom={VSS_MOMENTUM})", alpha=0.6)
 
@@ -393,6 +422,23 @@ if __name__ == "__main__":
     print("-" * 55)
     for name, (avg, ss) in results.items():
         print(f"{name:<20} | {10*np.log10(avg):>12.2f} dB | {10*np.log10(ss):>12.2f} dB")
+
+    # Step Size Summary
+    print("\n" + "="*60)
+    print("Step Size Summary (averaged over steady-state, symbols {} onwards):".format(burn_in))
+    print("="*60)
+    print(f"{'Method':<20} | {'Avg SS Step Size':<15} | {'Final SS Step Size':<18}")
+    print("-" * 60)
+    for name in results.keys():
+        if name in step_size_history:
+            mu_trace = step_size_history[name]
+            avg_ss_mu = torch.mean(mu_trace[burn_in:]).item() if len(mu_trace) > burn_in else torch.mean(mu_trace).item()
+            final_ss_mu = mu_trace[-1].item() if len(mu_trace) > 0 else 0.0
+            print(f"{name:<20} | {avg_ss_mu:<15.6f} | {final_ss_mu:<18.6f}")
+        elif name == "RLS":
+            print(f"{name:<20} | {'N/A (RLS)':<15} | {'N/A (forgetting λ)':<18}")
+        else:
+            print(f"{name:<20} | {'N/A':<15} | {'N/A':<18}")
 
     # Print final FFE and DFE taps for each method (show 2-3 example channels)
     print("\nFinal Equalizer Taps (2-3 example channels):")

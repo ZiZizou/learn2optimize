@@ -89,6 +89,7 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
 
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
     mse_log = []
+    mu_log = []  # Track step sizes
 
     # Initialize momentum buffers for heavy-ball optimization
     dfe_momentum_buffer = torch.zeros(num_taps, dtype=torch.float32)
@@ -118,6 +119,7 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             decision = torch.sign(eq_out)
             e_t = tx_symbols[target_idx] - eq_out
             mse_log.append((e_t.item())**2)
+            mu_log.append(current_mu)
 
             # Continuous Variable Step-Size (VSS) Update
             if use_vss:
@@ -149,6 +151,7 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             # Warmup phase: not enough history for valid error computation
             # Log zero error but still build up ffe_buffer
             mse_log.append(0.0)
+            mu_log.append(current_mu)
 
             # Update feedback weights with zero error (no learning)
             decision_buffer = torch.roll(decision_buffer, shifts=1)
@@ -157,7 +160,7 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             else:
                 decision_buffer[0] = 0.0
 
-    return torch.tensor(mse_log), weights, w_ffe
+    return torch.tensor(mse_log), weights, w_ffe, torch.tensor(mu_log)
 
 
 # ==========================================
@@ -335,9 +338,11 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
         avg_mse_history: Averaged MSE across batch dimension [seq_len]
         all_dfe_weights: List of final DFE weights per channel [batch_size, num_taps]
         all_ffe_weights: List of final FFE weights per channel [batch_size, FFE_TAPS]
+        avg_mu_history: Averaged step size across batch dimension [seq_len] (for VSS)
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
+    mu_histories = []
     all_dfe_weights = []
     all_ffe_weights = []
 
@@ -345,12 +350,13 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
         rx_i = rx_batch[i]  # [seq_len]
         tx_i = tx_batch[i]  # [seq_len]
 
-        mse_history, weights, w_main = run_nlms_dfe(
+        mse_history, weights, w_main, mu_history = run_nlms_dfe(
             rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
             use_vss=use_vss, vss_mu_max=vss_mu_max, vss_mu_min=vss_mu_min,
             vss_alpha=vss_alpha, vss_gamma=vss_gamma, vss_momentum=vss_momentum
         )
         mse_histories.append(mse_history)
+        mu_histories.append(mu_history)
         all_dfe_weights.append(weights.cpu().numpy())
         all_ffe_weights.append(w_main.cpu().numpy())
 
@@ -358,7 +364,10 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
     mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
     avg_mse_history = torch.mean(mse_stacked, dim=0)   # [seq_len]
 
-    return avg_mse_history, all_dfe_weights, all_ffe_weights
+    mu_stacked = torch.stack(mu_histories, dim=0)  # [batch_size, seq_len]
+    avg_mu_history = torch.mean(mu_stacked, dim=0)   # [seq_len]
+
+    return avg_mse_history, all_dfe_weights, all_ffe_weights, avg_mu_history
 
 
 # ==========================================

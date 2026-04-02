@@ -31,7 +31,7 @@ class AdvancedWirelineChannelGenerator:
         device (torch.device): Device to run computations on.
     """
 
-    def __init__(self, num_taps=None, snr_range=None, device=None):
+    def __init__(self, num_taps=None, snr_range=None, device=None, disable_agc=False):
         """
         Initialize the advanced wireline channel generator.
 
@@ -41,12 +41,15 @@ class AdvancedWirelineChannelGenerator:
             snr_range (tuple, optional): Signal-to-noise ratio range in dB as (min, max).
                                          Samples uniformly per batch. Defaults to SNR_RANGE from config.
             device (torch.device, optional): Device for computations. If None, uses CUDA if available.
+            disable_agc (bool, optional): If True, bypasses L2/peak normalization to preserve
+                                         true insertion loss physics (raw attenuated voltages).
         """
         self.num_taps = CH_TAPS if num_taps is None else num_taps
         self.snr_range = SNR_RANGE if snr_range is None else snr_range
         self.device = device if device is not None else torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
+        self.disable_agc = disable_agc
 
     def _sample_channel_parameters(self, batch_size):
         """
@@ -135,7 +138,8 @@ class AdvancedWirelineChannelGenerator:
         # The peak should be at index 0, but we normalize by the maximum value
         max_vals = h.max(dim=1, keepdim=True)[0]
         # h = h / max_vals
-        h = h / torch.norm(h, dim=1, keepdim=True)
+        if not self.disable_agc:
+            h = h / torch.norm(h, dim=1, keepdim=True)
 
         return h
 
@@ -228,7 +232,8 @@ class AdvancedWirelineChannelGenerator:
         max_vals = h_time_varying.max(dim=2, keepdim=True)[0]
         # h_time_varying = h_time_varying / max_vals
 
-        h_time_varying = h_time_varying / torch.norm(h_time_varying, dim=2, keepdim=True)
+        if not self.disable_agc:
+            h_time_varying = h_time_varying / torch.norm(h_time_varying, dim=2, keepdim=True)
 
         return h_time_varying
 

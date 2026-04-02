@@ -10,13 +10,18 @@ import torch.nn.functional as F
 
 
 class WirelineChannelGenerator:
-    def __init__(self, num_taps=50, snr_range=(15, 25)):
+    def __init__(self, num_taps=50, snr_range=(15, 25), disable_agc=False):
         """
         Generates channels with lengths of 20-50 taps
         and AWGN with SNR of 15-25 dB[cite: 55].
+
+        Args:
+            disable_agc: If True, bypasses L2/peak normalization to preserve
+                        true insertion loss physics (raw attenuated voltages).
         """
         self.num_taps = num_taps
         self.snr_range = snr_range
+        self.disable_agc = disable_agc
 
     def generate_batch(self, batch_size):
         # Alternative to Rayleigh fading[cite: 54]: Simulate wireline low-pass RC/RLC step responses
@@ -37,7 +42,8 @@ class WirelineChannelGenerator:
                 idx = torch.randint(5, self.num_taps, (1,)).item()
                 h[idx] += torch.empty(1).uniform_(-0.2, 0.2).item()
 
-            h = h / torch.norm(h)  # Normalize energy
+            if not self.disable_agc:
+                h = h / torch.norm(h)  # Normalize energy
             channels.append(h)
 
         return torch.stack(channels)
@@ -66,8 +72,9 @@ class WirelineChannelGenerator:
 
         # Prompt 2: Main Cursor Normalization / Ideal AGC
         # Normalize so the main cursor (peak amplitude) is exactly 1.0
-        peak_vals, _ = torch.max(torch.abs(h_batch), dim=1, keepdim=True)
-        h_batch = h_batch / (peak_vals + 1e-8)
+        if not self.disable_agc:
+            peak_vals, _ = torch.max(torch.abs(h_batch), dim=1, keepdim=True)
+            h_batch = h_batch / (peak_vals + 1e-8)
 
         h_reshaped = h_batch.view(batch_size, 1, channel_len)
 

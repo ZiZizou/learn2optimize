@@ -32,6 +32,13 @@ def add_channel_args(parser: argparse.ArgumentParser):
              "'advanced' for AdvancedWirelineChannelGenerator with resonant ringing, "
              "PA saturation, and dynamic drift."
     )
+    parser.add_argument(
+        "--disable_agc",
+        action="store_true",
+        help="Disable automatic gain control (AGC) normalization. When enabled, channel "
+             "impulse responses preserve true insertion loss physics with raw, attenuated "
+             "voltages rather than being normalized to unit peak/L2 norm."
+    )
     return parser
 
 
@@ -46,14 +53,17 @@ def get_channel_generator(args, device=None):
     Returns:
         WirelineChannelGenerator or AdvancedWirelineChannelGenerator instance.
     """
+    disable_agc = getattr(args, 'disable_agc', False)
     if args.channel_type == "advanced":
         return AdvancedWirelineChannelGenerator(
             num_taps=CH_TAPS,
             snr_range=SNR_RANGE,
-            device=device
+            device=device,
+            disable_agc=disable_agc
         )
     else:
         return WirelineChannelGenerator(
             num_taps=CH_TAPS,
-            snr_range=SNR_RANGE
+            snr_range=SNR_RANGE,
+            disable_agc=disable_agc
         )
