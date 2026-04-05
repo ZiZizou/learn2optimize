@@ -10,11 +10,20 @@ Augmentations:
 - Insertion Loss (IL) Tilting: Simulates variations in dielectric loss/cable length (RC filtering)
 - Random Reflections: Simulates via/connector impedance mismatches (Time-domain spike injection)
 - Mixup: Mathematical regularization (Linear interpolation between two channels)
+
+Physics Note:
+The THRU (main victim channel), FEXT (Far-End Crosstalk), and NEXT (Near-End Crosstalk)
+are kept separate. Augmentations are applied ONLY to the THRU channel because:
+- Aggressor transmitters send independent, asynchronous random bit sequences
+- Superposition applies to voltages at the receiver, not to impulse responses
+- FEXT/NEXT act as bounded colored noise signatures specific to the physical layout
 """
 
 import argparse
+import os
 import pathlib
-from typing import List, Optional
+import random
+from typing import List, Optional, Dict, Union
 
 import numpy as np
 import torch
@@ -34,69 +43,61 @@ CH_TAPS = 50  # Number of taps in the wireline channel (from config.py)
 
 
 # ==========================================
-# Step 2: Extract S-Parameters to Impulse Responses
+# Step 2: S-Parameter Extraction Helper
 # ==========================================
 
-def parse_s4p_files(s4p_dir: pathlib.Path, num_taps: int = CH_TAPS) -> torch.Tensor:
+def extract_and_resample_ir(filepath: pathlib.Path, num_taps: int = CH_TAPS) -> np.ndarray:
     """
-    Parse a directory of .s4p files and convert them to time-domain impulse responses.
+    Extract impulse response from an S4P file and resample to fixed number of taps.
 
     Args:
-        s4p_dir: Directory containing .s4p Touchstone files
-        num_taps: Fixed number of taps to resample/interpolate IRs to
+        filepath: Path to the .s4p file
+        num_taps: Fixed number of taps to resample to
 
     Returns:
-        base_tensor: Tensor of shape [N, num_taps] containing all parsed base channels
+        1D numpy array of shape [num_taps]
     """
     if not HAS_SKRF:
-        raise RuntimeError("scikit-rf is required to parse .s4p files. Install with: pip install scikit-rf")
+        raise RuntimeError("scikit-rf is required to parse .s4p files")
 
-    s4p_files = list(s4p_dir.glob("*.s4p"))
-    if not s4p_files:
-        raise FileNotFoundError(f"No .s4p files found in {s4p_dir}")
+    # Read the network
+    network = skrf.Network(str(filepath))
 
-    base_channels = []
-    for s4p_file in s4p_files:
-        try:
-            # Read the 4-port single-ended network
-            network = skrf.Network(str(s4p_file))
+    # Extract S21 (forward transmission from port 1 to port 2)
+    # For differential THRU channels, S21 represents the differential insertion loss
+    if network.number_of_ports == 4:
+        # 4-port file: extract S21
+        s21 = network.s[:, 1, 0]  # row=1, col=0 -> S21
+    elif network.number_of_ports == 2:
+        # 2-port file: extract S21 directly
+        s21 = network.s[:, 1, 0]
+    else:
+        raise ValueError(f"Unsupported number of ports: {network.number_of_ports}")
 
-            # Convert to mixed-mode (differential) S-parameters
-            # p=2 indicates we want differential mode for ports 1,2 (originally single-ended)
-            mm_network = skrf.se2gmm(network, p=2)
+    # Get frequency info
+    freq = network.frequency
+    f = freq.f
+    n = len(s21)
 
-            # Extract Differential Insertion Loss Sdd21 = mm_network.s[p, q] where:
-            # Sdd21 is at index [1, 0] in the mixed-mode S-matrix (output port 2, input port 1)
-            sdd21 = mm_network.s[1, 0]
+    # Check if frequency starts at 0
+    if f[0] != 0:
+        print(f"  Warning: Frequency doesn't start at 0 Hz for {filepath.name}, results may be distorted")
 
-            # Get frequency array and compute time-domain impulse response
-            # Using the built-in impulse_response method
-            ir = mm_network.impulse_response(port=("mixed", 2, 1), window=("kaiser", 6.0))
+    # Compute impulse response using IFFT
+    # IFFT of S21 gives the time-domain impulse response
+    ir = np.fft.ifftshift(np.fft.ifft(s21, n=n))
 
-            # ir is typically [N, 2, 2] or similar; extract the differential channel
-            # The impulse response from se2gmm with port=("mixed", 2, 1) gives Sdd21 response
-            if ir.ndim > 1:
-                # Take the appropriate component (usually [0, 0] or just flatten)
-                ir = ir.flatten()
+    # Take magnitude (the physical impulse response is the envelope)
+    # For a causal system, we use the real part or magnitude
+    ir = np.abs(ir)
 
-            # Resample/interpolate to fixed num_taps
-            ir_resampled = resample_ir(ir, num_taps)
+    # Resample/interpolate to fixed num_taps
+    ir_resampled = resample_ir(ir, num_taps)
 
-            # Normalize
-            ir_resampled = ir_resampled / (np.linalg.norm(ir_resampled) + 1e-8)
+    # Normalize
+    ir_resampled = ir_resampled / (np.linalg.norm(ir_resampled) + 1e-8)
 
-            base_channels.append(ir_resampled)
-
-            print(f"  Parsed: {s4p_file.name} -> {len(ir)} taps -> resampled to {num_taps}")
-
-        except Exception as e:
-            print(f"  Warning: Failed to parse {s4p_file.name}: {e}")
-            continue
-
-    if not base_channels:
-        raise RuntimeError("No valid channels could be parsed from the .s4p files")
-
-    return torch.tensor(np.array(base_channels), dtype=torch.float32)
+    return ir_resampled
 
 
 def resample_ir(ir: np.ndarray, num_taps: int) -> np.ndarray:
@@ -115,22 +116,130 @@ def resample_ir(ir: np.ndarray, num_taps: int) -> np.ndarray:
     return np.interp(x_new, x_orig, ir)
 
 
-def generate_dummy_base_channels(num_channels: int = 10, num_taps: int = CH_TAPS) -> torch.Tensor:
+# ==========================================
+# Step 1: Recursive Directory Traversal & File Classification
+# ==========================================
+
+def parse_s4p_directory_tree(
+    base_dir: pathlib.Path,
+    num_taps: int = CH_TAPS
+) -> List[Dict[str, Union[torch.Tensor, List[torch.Tensor], None]]]:
+    """
+    Recursively walk a directory tree and parse S4P files into channel groups.
+
+    Each leaf directory containing .s4p files is treated as a channel group with:
+    - Exactly 1 THRU (main victim channel)
+    - 0 or more FEXT (Far-End Crosstalk) files
+    - 0 or more NEXT (Near-End Crosstalk) files
+
+    Args:
+        base_dir: Root directory to walk
+        num_taps: Number of taps to resample IRs to
+
+    Returns:
+        List of channel group dictionaries:
+        [{
+            'thru': torch.Tensor of shape [num_taps],  # Main victim channel
+            'fext': List[torch.Tensor] or None,       # List of FEXT IRs
+            'next': List[torch.Tensor] or None,       # List of NEXT IRs
+            'source_dir': str                           # Source directory name for logging
+        }, ...]
+    """
+    if not HAS_SKRF:
+        raise RuntimeError("scikit-rf is required to parse .s4p files. Install with: pip install scikit-rf")
+
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Directory not found: {base_dir}")
+
+    parsed_groups = []
+
+    print(f"Walking directory tree: {base_dir}")
+
+    for root, dirs, files in os.walk(base_dir):
+        # Filter for .s4p files only
+        s4p_files = [f for f in files if f.lower().endswith('.s4p')]
+
+        if not s4p_files:
+            continue
+
+        # Initialize group
+        group = {
+            'thru': None,
+            'fext': [],
+            'next': [],
+            'source_dir': os.path.basename(root)
+        }
+
+        # Process each file
+        for filename in s4p_files:
+            filepath = pathlib.Path(root) / filename
+
+            try:
+                ir = extract_and_resample_ir(filepath, num_taps)
+                ir_tensor = torch.tensor(ir, dtype=torch.float32)
+
+                filename_lower = filename.lower()
+
+                if 'thru' in filename_lower:
+                    if group['thru'] is not None:
+                        print(f"  Warning: Multiple thru files in {root}, using first")
+                    group['thru'] = ir_tensor
+
+                elif 'fext' in filename_lower:
+                    group['fext'].append(ir_tensor)
+
+                elif 'next' in filename_lower:
+                    group['next'].append(ir_tensor)
+
+                else:
+                    # If no classification, try to use as thru anyway
+                    if group['thru'] is None:
+                        print(f"  Warning: Could not classify {filename}, treating as thru")
+                        group['thru'] = ir_tensor
+                    else:
+                        print(f"  Warning: Could not classify {filename}, skipping")
+
+            except Exception as e:
+                print(f"  Warning: Failed to parse {filepath}: {e}")
+                continue
+
+        # Only add groups that have a valid thru channel
+        if group['thru'] is not None:
+            parsed_groups.append(group)
+            fext_count = len(group['fext'])
+            next_count = len(group['next'])
+            print(f"  Found group: {group['source_dir']} - 1 thru, {fext_count} fext, {next_count} next")
+
+    if not parsed_groups:
+        raise RuntimeError("No valid channel groups found (no directories with thru files)")
+
+    print(f"\nTotal: Found {len(parsed_groups)} channel groups")
+    return parsed_groups
+
+
+# ==========================================
+# Dummy Data Generation
+# ==========================================
+
+def generate_dummy_base_channels(
+    num_channels: int = 10,
+    num_taps: int = CH_TAPS
+) -> List[Dict[str, Union[torch.Tensor, List[torch.Tensor], None]]]:
     """
     Generate synthetic base channels when no .s4p files are available.
     Uses a simplified RC low-pass model with reflections (same as wireline_channel.py).
 
     Args:
-        num_channels: Number of dummy channels to generate
+        num_channels: Number of dummy channel groups to generate
         num_taps: Number of taps per channel
 
     Returns:
-        Tensor of shape [num_channels, num_taps]
+        List of channel group dictionaries (same structure as parse_s4p_directory_tree)
     """
-    t = np.linspace(0, 5, num_taps)
-    channels = []
+    groups = []
 
-    for _ in range(num_channels):
+    for i in range(num_channels):
+        t = np.linspace(0, 5, num_taps)
         tau = np.random.uniform(0.5, 1.5)
         h = np.exp(-t / tau)
 
@@ -141,37 +250,60 @@ def generate_dummy_base_channels(num_channels: int = 10, num_taps: int = CH_TAPS
             h[idx] += np.random.uniform(-0.2, 0.2)
 
         h = h / (np.linalg.norm(h) + 1e-8)
-        channels.append(h)
+        thru_tensor = torch.tensor(h, dtype=torch.float32)
 
-    return torch.tensor(np.array(channels), dtype=torch.float32)
+        # Generate random FEXT/NEXT (sometimes)
+        fext_list = []
+        next_list = []
+
+        if random.random() > 0.3:  # 70% chance of having FEXT
+            h_fext = np.exp(-t / np.random.uniform(0.5, 1.5))
+            h_fext = h_fext / (np.linalg.norm(h_fext) + 1e-8)
+            fext_list.append(torch.tensor(h_fext, dtype=torch.float32))
+
+        if random.random() > 0.3:  # 70% chance of having NEXT
+            h_next = np.exp(-t / np.random.uniform(0.5, 1.5))
+            h_next = h_next / (np.linalg.norm(h_next) + 1e-8)
+            next_list.append(torch.tensor(h_next, dtype=torch.float32))
+
+        groups.append({
+            'thru': thru_tensor,
+            'fext': fext_list if fext_list else None,
+            'next': next_list if next_list else None,
+            'source_dir': f'dummy_channel_{i}'
+        })
+
+    return groups
 
 
 # ==========================================
-# Step 3: Implement the 4 Augmentation Functions
+# Step 3: Augmentation Functions (apply to THRU only)
 # ==========================================
 
-def augment_cascade(h_batch: torch.Tensor, base_pool: torch.Tensor) -> torch.Tensor:
+def augment_cascade(
+    h_batch: torch.Tensor,
+    thru_pool: torch.Tensor
+) -> torch.Tensor:
     """
     Channel Cascade (Convolution): Simulates plugging two cables together.
 
-    Randomly selects channels from the base_pool to convolve with h_batch using
+    Randomly selects channels from the thru_pool to convolve with h_batch using
     frequency-domain convolution for efficiency.
 
     Args:
-        h_batch: Batch of channels [batch_size, num_taps]
-        base_pool: Pool of base channels to sample from [N, num_taps]
+        h_batch: Batch of THRU channels [batch_size, num_taps]
+        thru_pool: Pool of base THRU channels to sample from [N, num_taps]
 
     Returns:
         Augmented batch of same shape [batch_size, num_taps]
     """
     batch_size, num_taps = h_batch.shape
 
-    # Sample random channels from base_pool for each batch element
-    indices = torch.randint(0, len(base_pool), (batch_size,))
-    h_cascade = base_pool[indices]  # [batch_size, num_taps]
+    # Sample random channels from thru_pool for each batch element
+    indices = torch.randint(0, len(thru_pool), (batch_size,))
+    h_cascade = thru_pool[indices]  # [batch_size, num_taps]
 
     # Use FFT-based convolution for efficiency
-    # Pad both to same length for proper convolution
     conv_length = num_taps * 2 - 1
 
     # Convert to frequency domain
@@ -190,7 +322,10 @@ def augment_cascade(h_batch: torch.Tensor, base_pool: torch.Tensor) -> torch.Ten
     return result / (torch.norm(result, dim=1, keepdim=True) + 1e-8)
 
 
-def augment_il_tilt(h_batch: torch.Tensor, alpha_range: tuple = (0.0, 0.4)) -> torch.Tensor:
+def augment_il_tilt(
+    h_batch: torch.Tensor,
+    alpha_range: tuple = (0.0, 0.4)
+) -> torch.Tensor:
     """
     Insertion Loss Tilting (RC Filtering): Simulates extra high-frequency loss.
 
@@ -250,15 +385,19 @@ def augment_reflections(
     return h_aug / (torch.norm(h_aug, dim=1, keepdim=True) + 1e-8)
 
 
-def augment_mixup(h_batch: torch.Tensor, base_pool: torch.Tensor, lam_range: tuple = (0.2, 0.8)) -> torch.Tensor:
+def augment_mixup(
+    h_batch: torch.Tensor,
+    thru_pool: torch.Tensor,
+    lam_range: tuple = (0.2, 0.8)
+) -> torch.Tensor:
     """
     Mixup: Linear interpolation between two channels for regularization.
 
     h_new = lambda * h_batch + (1 - lambda) * h_random
 
     Args:
-        h_batch: Batch of channels [batch_size, num_taps]
-        base_pool: Pool of base channels to sample from [N, num_taps]
+        h_batch: Batch of THRU channels [batch_size, num_taps]
+        thru_pool: Pool of base THRU channels to sample from [N, num_taps]
         lam_range: Tuple of (min, max) lambda values for interpolation
 
     Returns:
@@ -266,9 +405,9 @@ def augment_mixup(h_batch: torch.Tensor, base_pool: torch.Tensor, lam_range: tup
     """
     batch_size = h_batch.shape[0]
 
-    # Sample random channels from base_pool
-    indices = torch.randint(0, len(base_pool), (batch_size,))
-    h_random = base_pool[indices]
+    # Sample random channels from thru_pool
+    indices = torch.randint(0, len(thru_pool), (batch_size,))
+    h_random = thru_pool[indices]
 
     # Random lambda uniformly sampled
     lam = torch.empty(batch_size, 1).uniform_(lam_range[0], lam_range[1])
@@ -280,34 +419,51 @@ def augment_mixup(h_batch: torch.Tensor, base_pool: torch.Tensor, lam_range: tup
 
 
 # ==========================================
-# Step 4: CLI and Composable Pipeline
+# Step 4: Composable Pipeline
 # ==========================================
 
-def sample_random_channels(pool: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """Sample a random batch of channels from a pool."""
-    indices = torch.randint(0, len(pool), (batch_size,))
-    return pool[indices].clone()
+def sample_random_groups(
+    groups: List[Dict],
+    batch_size: int
+) -> tuple:
+    """
+    Sample random channel groups and extract their THRU tensors.
+
+    Returns:
+        Tuple of (thru_batch, associated_groups)
+        - thru_batch: [batch_size, num_taps] tensor
+        - associated_groups: list of original group dicts
+    """
+    indices = torch.randint(0, len(groups), (batch_size,))
+    thru_batch = torch.stack([groups[i]['thru'] for i in indices])
+    associated_groups = [groups[i] for i in indices]
+    return thru_batch, associated_groups
 
 
 def generate_synthetic_channels(
-    base_pool: torch.Tensor,
+    parsed_groups: List[Dict],
     num_generated: int,
     batch_size: int = 64,
     channel_cascade: bool = False,
     insertion_loss_tilting: bool = False,
     random_reflection: bool = False,
     mixup: bool = False,
-) -> torch.Tensor:
+) -> List[Dict]:
     """
-    Generate synthetic channels by applying augmentations to base channels.
+    Generate synthetic channels by applying augmentations to THRU channels only.
 
     Pipeline order (as specified):
     1. Mixup/Cascade (Creates the new base geometry)
     2. Insertion Loss Tilting (Applies global frequency-domain shift)
     3. Random Reflections (Injects local time-domain spikes)
 
+    For each generated sample:
+    - A base channel group is randomly selected
+    - Augmentations are applied ONLY to the THRU channel
+    - Associated FEXT/NEXT are carried forward (one randomly sampled if multiple exist)
+
     Args:
-        base_pool: Pool of parsed base channels [N, num_taps]
+        parsed_groups: List of channel group dicts from parse_s4p_directory_tree
         num_generated: Total number of synthetic channels to generate
         batch_size: Batch size for generation loop
         channel_cascade: Whether to apply cascade augmentation
@@ -316,43 +472,90 @@ def generate_synthetic_channels(
         mixup: Whether to apply mixup augmentation
 
     Returns:
-        Tensor of shape [num_generated, num_taps]
+        List of synthetic channel group dicts:
+        [{
+            'thru': torch.Tensor [num_taps],
+            'fext': torch.Tensor or None,
+            'next': torch.Tensor or None,
+        }, ...]
     """
-    all_channels = []
+    # Build a pool of just THRU channels for cascade/mixup operations
+    thru_pool = torch.stack([g['thru'] for g in parsed_groups])
+
+    synthetic_dataset = []
     num_complete_batches = num_generated // batch_size
     remainder = num_generated % batch_size
 
     for batch_idx in range(num_complete_batches):
-        # Sample a starting batch from the parsed S4P base pool
-        h_current = sample_random_channels(base_pool, batch_size)
+        # Sample random groups
+        h_current, associated_groups = sample_random_groups(parsed_groups, batch_size)
 
-        # Apply augmentations in order
+        # Apply augmentations in order (only to THRU)
         if mixup:
-            h_current = augment_mixup(h_current, base_pool)
+            h_current = augment_mixup(h_current, thru_pool)
         if channel_cascade:
-            h_current = augment_cascade(h_current, base_pool)
+            h_current = augment_cascade(h_current, thru_pool)
         if insertion_loss_tilting:
             h_current = augment_il_tilt(h_current)
         if random_reflection:
             h_current = augment_reflections(h_current)
 
-        all_channels.append(h_current)
+        # Build output groups
+        for i in range(batch_size):
+            group = {
+                'thru': h_current[i],  # [num_taps]
+            }
+
+            # Randomly sample one FEXT if available
+            if associated_groups[i]['fext']:
+                group['fext'] = random.choice(associated_groups[i]['fext'])
+            else:
+                group['fext'] = None
+
+            # Randomly sample one NEXT if available
+            if associated_groups[i]['next']:
+                group['next'] = random.choice(associated_groups[i]['next'])
+            else:
+                group['next'] = None
+
+            synthetic_dataset.append(group)
 
     # Handle remainder
     if remainder > 0:
-        h_current = sample_random_channels(base_pool, remainder)
+        h_current, associated_groups = sample_random_groups(parsed_groups, remainder)
+
         if mixup:
-            h_current = augment_mixup(h_current, base_pool)
+            h_current = augment_mixup(h_current, thru_pool)
         if channel_cascade:
-            h_current = augment_cascade(h_current, base_pool)
+            h_current = augment_cascade(h_current, thru_pool)
         if insertion_loss_tilting:
             h_current = augment_il_tilt(h_current)
         if random_reflection:
             h_current = augment_reflections(h_current)
-        all_channels.append(h_current)
 
-    return torch.cat(all_channels, dim=0)
+        for i in range(remainder):
+            group = {
+                'thru': h_current[i],
+            }
 
+            if associated_groups[i]['fext']:
+                group['fext'] = random.choice(associated_groups[i]['fext'])
+            else:
+                group['fext'] = None
+
+            if associated_groups[i]['next']:
+                group['next'] = random.choice(associated_groups[i]['next'])
+            else:
+                group['next'] = None
+
+            synthetic_dataset.append(group)
+
+    return synthetic_dataset
+
+
+# ==========================================
+# Step 5: CLI and Main
+# ==========================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -362,19 +565,19 @@ def main():
         "--s4p_dir",
         type=str,
         default=None,
-        help="Directory containing .s4p Touchstone files. If None, uses dummy data."
+        help="Root directory containing .s4p files (recursive). If None, uses dummy data."
     )
     parser.add_argument(
         "--out_file",
         type=str,
         default="synthetic_channels.pt",
-        help="Output file path for the generated channels (default: synthetic_channels.pt)"
+        help="Output file path for the generated channels (default: synthetic_channels.pt). 'synth' is auto-added if not present."
     )
     parser.add_argument(
         "--num_generated",
         type=int,
         default=50000,
-        help="Total number of synthetic channels to generate (default: 50000)"
+        help="Total number of synthetic channel groups to generate (default: 50000)"
     )
     parser.add_argument(
         "--batch_size",
@@ -417,47 +620,46 @@ def main():
         "--num_base_channels",
         type=int,
         default=10,
-        help="Number of base channels to generate when using dummy data (default: 10)"
+        help="Number of base channel groups to generate when using dummy data (default: 10)"
     )
 
     args = parser.parse_args()
 
-    # Parse or generate base channels
+    # Parse or generate base channel groups
     if args.dummy_data or args.s4p_dir is None:
-        print(f"Generating {args.num_base_channels} dummy base channels...")
-        base_pool = generate_dummy_base_channels(
+        print(f"Generating {args.num_base_channels} dummy base channel groups...")
+        parsed_groups = generate_dummy_base_channels(
             num_channels=args.num_base_channels,
             num_taps=args.num_taps
         )
-        print(f"  Generated {len(base_pool)} dummy base channels")
+        print(f"  Generated {len(parsed_groups)} dummy base channel groups")
     else:
         s4p_dir = pathlib.Path(args.s4p_dir)
         if not s4p_dir.exists():
             raise FileNotFoundError(f"Directory not found: {s4p_dir}")
-        print(f"Parsing .s4p files from {s4p_dir}...")
-        base_pool = parse_s4p_files(s4p_dir, num_taps=args.num_taps)
-        print(f"  Parsed {len(base_pool)} base channels from .s4p files")
+        print(f"Parsing .s4p files from {s4p_dir} (recursive)...")
+        parsed_groups = parse_s4p_directory_tree(s4p_dir, num_taps=args.num_taps)
+        print(f"  Parsed {len(parsed_groups)} channel groups from .s4p files")
 
     # Check if any augmentations are enabled
     any_aug = (args.channel_cascade or args.insertion_loss_tilting or
                args.random_reflection or args.mixup)
 
     if any_aug:
-        print(f"\nGenerating {args.num_generated} synthetic channels with augmentations:")
+        print(f"\nGenerating {args.num_generated} synthetic channel groups with augmentations:")
         print(f"  - Cascade: {args.channel_cascade}")
         print(f"  - IL Tilt: {args.insertion_loss_tilting}")
         print(f"  - Reflections: {args.random_reflection}")
         print(f"  - Mixup: {args.mixup}")
     else:
-        print(f"\nNo augmentations enabled. Saving {len(base_pool)} base channels as-is.")
-        # Just save the base pool
-        torch.save(base_pool, args.out_file)
+        print(f"\nNo augmentations enabled. Saving {len(parsed_groups)} base channel groups as-is.")
+        torch.save(parsed_groups, args.out_file)
         print(f"Saved to {args.out_file}")
         return
 
     # Generate synthetic channels
-    synthetic_channels = generate_synthetic_channels(
-        base_pool=base_pool,
+    synthetic_dataset = generate_synthetic_channels(
+        parsed_groups=parsed_groups,
         num_generated=args.num_generated,
         batch_size=args.batch_size,
         channel_cascade=args.channel_cascade,
@@ -466,19 +668,37 @@ def main():
         mixup=args.mixup,
     )
 
+    # Mark each group as synthetic
+    for group in synthetic_dataset:
+        group['synth'] = True
+
+    # Auto-add 'synth' to output filename if not present
+    if 'synth' not in args.out_file.lower():
+        base, ext = os.path.splitext(args.out_file)
+        args.out_file = f"{base}_synth{ext}"
+
     # Summary statistics
     print(f"\n--- Summary ---")
-    print(f"Base pool size: {len(base_pool)} channels")
-    print(f"Generated {len(synthetic_channels)} synthetic channels")
-    print(f"Shape: {synthetic_channels.shape}")
-    print(f"dtype: {synthetic_channels.dtype}")
-    print(f"Mean: {synthetic_channels.mean():.6f}")
-    print(f"Std: {synthetic_channels.std():.6f}")
-    print(f"Min: {synthetic_channels.min():.6f}")
-    print(f"Max: {synthetic_channels.max():.6f}")
+    print(f"Base channel groups: {len(parsed_groups)}")
+    print(f"Generated {len(synthetic_dataset)} synthetic channel groups")
+
+    # Count FEXT/NEXT availability
+    fext_count = sum(1 for g in synthetic_dataset if g['fext'] is not None)
+    next_count = sum(1 for g in synthetic_dataset if g['next'] is not None)
+    print(f"Groups with FEXT: {fext_count} ({100*fext_count/len(synthetic_dataset):.1f}%)")
+    print(f"Groups with NEXT: {next_count} ({100*next_count/len(synthetic_dataset):.1f}%)")
+
+    # THRU statistics
+    thru_stack = torch.stack([g['thru'] for g in synthetic_dataset])
+    print(f"\nTHRU statistics:")
+    print(f"  Shape: {thru_stack.shape}")
+    print(f"  Mean: {thru_stack.mean():.6f}")
+    print(f"  Std: {thru_stack.std():.6f}")
+    print(f"  Min: {thru_stack.min():.6f}")
+    print(f"  Max: {thru_stack.max():.6f}")
 
     # Save output
-    torch.save(synthetic_channels, args.out_file)
+    torch.save(synthetic_dataset, args.out_file)
     print(f"\nSaved to {args.out_file}")
 
 
