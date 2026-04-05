@@ -1,8 +1,20 @@
 """
-Continuous-Time CTLE Wrapper using SerDesPy/scipy
+DEPRECATED: Continuous-Time CTLE Wrapper using SerDesPy/scipy
 
-This module provides a physically-accurate continuous-time CTLE implementation
-that replaces the discrete FIR-based DifferentiableCTLE when ablate_ctle=True.
+This module is DEPRECATED in favor of the frequency-domain approach
+implemented in ctle_frequency_utils.py.
+
+The frequency-domain approach evaluates the exact analog transfer function
+H(s) directly at FFT frequency bins, bypassing the bilinear transform
+entirely and enabling parallelized GPU processing.
+
+Please use ctle_frequency_utils.apply_frequency_domain_ctle instead.
+
+---
+
+Legacy Documentation:
+This module provided a physically-accurate continuous-time CTLE implementation
+that replaced the discrete FIR-based DifferentiableCTLE when ablate_ctle=True.
 
 The CTLE (Continuous-Time Linear Equalizer) is modeled as an analog pole-zero
 filter: H(s) = (s + ω_z) / (s + ω_p)

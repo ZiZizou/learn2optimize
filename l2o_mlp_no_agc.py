@@ -14,7 +14,7 @@ from config import *
 
 from wireline_channel import WirelineChannelGenerator
 from utils import add_channel_args, get_channel_generator
-from ctle_utils import apply_serdespy_ctle
+from ctle_frequency_utils import apply_frequency_domain_ctle
 
 # ==========================================
 # 2. Differentiable Parametric CTLE
@@ -73,42 +73,69 @@ class DifferentiableDFE(nn.Module):
 
 
 # ==========================================
-# 4. MLP-Based Learned Optimizer with LayerNorm (for No-AGC physics preservation)
+# 4. MLP-Based Learned Optimizer with Feature-Isolated EMA Normalization
 # ==========================================
 class MultiRateLearnedMLPNoAGC(nn.Module):
     """
-    Feedforward MLP with sliding history buffer and input-level LayerNorm.
+    Feedforward MLP with sliding history buffer and feature-isolated EMA normalization.
 
     This variant is designed for use with disable_agc=True channel generation,
     where raw attenuated voltages are passed through the signal processing pipeline
-    without ideal AGC normalization. The LayerNorm component protects the meta-optimizer
-    from unscaled feature magnitudes.
+    without ideal AGC normalization. Instead of LayerNorm, this uses EMA statistics
+    that are computed independently for error, energy, and weight feature groups.
 
     Architecture:
-    - LayerNorm: Normalizes the flattened history buffer to handle varying input scales
+    - Feature-Isolated EMA Buffers: Track running mean/variance for each physical group
+    - Deterministic Standardization: Uses stored EMA buffers for stable normalization
     - Deep feedforward MLP: Processes normalized features
     - Two-Head output: Base head (bounded) + Overdrive head (for acquisition)
 
     Scientific Rationale:
     - When AGC is disabled, channel impulse responses retain their true energy profile,
       leading to received signal amplitudes that vary with channel loss.
-    - The LayerNorm component provides stable gradients by normalizing across the
-      feature dimension, preventing the MLP from being overwhelmed by large/small inputs.
+    - Grouping features by physical meaning (error, energy, weight) prevents statistical
+      distortion from blending unrelated distributions.
     """
+
+    # Feature dimension constants (must match state_dim=6 layout)
+    ERROR_FEATURES = 2   # e_t, ema_error (indices 0, 1)
+    ENERGY_FEATURES = 1   # norm_sq (index 2)
+    WEIGHT_FEATURES = 3   # dfe_weight[0], ctle_peaking, grad_proxy_ctle (indices 3, 4, 5)
 
     def __init__(self, state_dim=6, history_len=10, hidden_dim=64, use_two_head=False):
         super().__init__()
         self.state_dim = state_dim
         self.history_len = history_len
         self.use_two_head = use_two_head
-        input_dim = state_dim * history_len
+        self.input_dim = state_dim * history_len
 
-        # Input-level LayerNorm to handle unscaled feature magnitudes from raw voltages
-        self.layer_norm = nn.LayerNorm(input_dim)
+        # EMA momentum (conservative to prevent single-batch outliers from hijacking)
+        self.momentum = 0.99
+
+        # Precompute feature slice indices
+        self.error_start = 0
+        self.error_end = self.ERROR_FEATURES * history_len
+        self.energy_start = self.error_end
+        self.energy_end = self.energy_start + self.ENERGY_FEATURES * history_len
+        self.weight_start = self.energy_end
+        self.weight_end = self.input_dim
+
+        # Phase 1: Feature-Isolated EMA Buffers
+        # Error features: [e_t, ema_error] across history
+        self.register_buffer('error_mean', torch.zeros(self.ERROR_FEATURES * history_len))
+        self.register_buffer('error_var', torch.ones(self.ERROR_FEATURES * history_len))
+
+        # Energy features: [norm_sq] across history
+        self.register_buffer('energy_mean', torch.zeros(self.ENERGY_FEATURES * history_len))
+        self.register_buffer('energy_var', torch.ones(self.ENERGY_FEATURES * history_len))
+
+        # Weight features: [dfe_weight[0], ctle_peaking, grad_proxy_ctle] across history
+        self.register_buffer('weight_mean', torch.zeros(self.WEIGHT_FEATURES * history_len))
+        self.register_buffer('weight_var', torch.ones(self.WEIGHT_FEATURES * history_len))
 
         # Deep feedforward network to handle increased input dimensionality
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(self.input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
@@ -123,6 +150,58 @@ class MultiRateLearnedMLPNoAGC(nn.Module):
 
         self.head_ctle = nn.Linear(hidden_dim, 1)
 
+    def _update_ema_buffers(self, history_buffer):
+        """
+        Phase 2: Dynamic EMA Update Mechanism
+
+        Updates the EMA buffers during forward pass when in training mode.
+        Computes batch statistics for each feature group and applies exponential smoothing.
+        """
+        # Extract feature slices from the flattened history
+        error_slice = history_buffer[:, self.error_start:self.error_end]
+        energy_slice = history_buffer[:, self.energy_start:self.energy_end]
+        weight_slice = history_buffer[:, self.weight_start:self.weight_end]
+
+        # Compute batch statistics (mean and variance across batch dimension)
+        batch_error_mean = error_slice.mean(dim=0)
+        batch_error_var = error_slice.var(dim=0)
+
+        batch_energy_mean = energy_slice.mean(dim=0)
+        batch_energy_var = energy_slice.var(dim=0)
+
+        batch_weight_mean = weight_slice.mean(dim=0)
+        batch_weight_var = weight_slice.var(dim=0)
+
+        # Apply exponential moving average update
+        self.error_mean = self.momentum * self.error_mean + (1 - self.momentum) * batch_error_mean
+        self.error_var = self.momentum * self.error_var + (1 - self.momentum) * batch_error_var
+
+        self.energy_mean = self.momentum * self.energy_mean + (1 - self.momentum) * batch_energy_mean
+        self.energy_var = self.momentum * self.energy_var + (1 - self.momentum) * batch_energy_var
+
+        self.weight_mean = self.momentum * self.weight_mean + (1 - self.momentum) * batch_weight_mean
+        self.weight_var = self.momentum * self.weight_var + (1 - self.momentum) * batch_weight_var
+
+    def _standardize_features(self, history_buffer):
+        """
+        Phase 3: Deterministic Feature Standardization
+
+        Applies standardization using stored EMA buffers to each feature group
+        independently before concatenation.
+        """
+        # Extract feature slices
+        error_slice = history_buffer[:, self.error_start:self.error_end]
+        energy_slice = history_buffer[:, self.energy_start:self.energy_end]
+        weight_slice = history_buffer[:, self.weight_start:self.weight_end]
+
+        # Standardize each group using EMA statistics
+        normalized_error = (error_slice - self.error_mean) / torch.sqrt(self.error_var + 1e-5)
+        normalized_energy = (energy_slice - self.energy_mean) / torch.sqrt(self.energy_var + 1e-5)
+        normalized_weight = (weight_slice - self.weight_mean) / torch.sqrt(self.weight_var + 1e-5)
+
+        # Concatenate standardized features
+        return torch.cat([normalized_error, normalized_energy, normalized_weight], dim=1)
+
     def forward(self, history_buffer, update_ctle=False):
         """
         Args:
@@ -134,8 +213,12 @@ class MultiRateLearnedMLPNoAGC(nn.Module):
             mu_ctle: [batch_size, 1] - CTLE step size
             mu_overdrive: [batch_size, 1] - Overdrive component (for regularization)
         """
-        # Apply LayerNorm to the flattened history buffer
-        normalized_history = self.layer_norm(history_buffer)
+        # Phase 2: Update EMA buffers during training
+        if self.training:
+            self._update_ema_buffers(history_buffer)
+
+        # Phase 3: Apply deterministic standardization using stored EMA buffers
+        normalized_history = self._standardize_features(history_buffer)
 
         features = self.mlp(normalized_history)
 
@@ -220,7 +303,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         with torch.no_grad():
             if ablate_ctle:
                 # Use continuous-time serdespy CTLE (Static LTI pre-filtering)
-                rx_init = apply_serdespy_ctle(rx_base, peaking_gain=0.5)
+                rx_init = apply_frequency_domain_ctle(rx_base, peaking_gain=0.5)
             else:
                 rx_init = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
             batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
@@ -358,11 +441,12 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     # Update EMA
                     ema_error = ema_beta * ema_error + (1 - ema_beta) * (e_t.detach() ** 2)
 
-                    # Update DFE weights
-                    dfe_weights = dfe_weights - (mu_dfe * e_t * decision_buffer / norm_sq)
+                    # Update DFE weights using Sign-Error LMS
+                    # Sign-Error LMS avoids near-zero division hazard in attenuated channels
+                    dfe_weights = dfe_weights - (mu_dfe * torch.sign(e_t) * decision_buffer)
 
-                    # Update Multi-Tap FFE weights
-                    w_ffe = w_ffe + (mu_dfe * e_t * ffe_buffer / norm_sq)
+                    # Update Multi-Tap FFE weights using Sign-Error LMS
+                    w_ffe = w_ffe + (mu_dfe * torch.sign(e_t) * ffe_buffer)
 
                     # Update CTLE if flag is set
                     if update_ctle_flag:
@@ -477,7 +561,7 @@ if __name__ == "__main__":
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
 
-    # Create MLP-based optimizer with LayerNorm for no-AGC operation
+    # Create MLP-based optimizer with Feature-Isolated EMA Normalization
     learned_opt = MultiRateLearnedMLPNoAGC(
         state_dim=L2O_STATE_DIM,
         history_len=L2O_MLP_HISTORY_LEN,
@@ -494,7 +578,8 @@ if __name__ == "__main__":
     print(f"Unroll length (TBPTT): {UNROLL_LEN}")
     print(f"MLP history length: {L2O_MLP_HISTORY_LEN}")
     print(f"MLP hidden dimension: {L2O_MLP_HIDDEN_DIM}")
-    print(f"LayerNorm enabled: True (for no-AGC physics preservation)")
+    print(f"Normalization: Feature-Isolated EMA (error/energy/weight groups)")
+    print(f"Update Rule: Sign-Error LMS (avoids near-zero division)")
     print(f"Two-head overdrive enabled: {args.two_head}")
     print("-" * 50)
 
@@ -542,4 +627,8 @@ if __name__ == "__main__":
 # 3. The MLP must learn to interpret the history pattern
 # 4. Memory is bounded by history_len * state_dim (fixed)
 # 5. TBPTT still applies to the unrolled DFE/FFE updates
-# 6. LayerNorm protects the MLP from unscaled feature magnitudes when AGC is disabled
+# 6. Feature-Isolated EMA Normalization: error, energy, and weight features are
+#    normalized independently using running EMA statistics, preserving absolute
+#    magnitude context while enabling stable gradient flow
+# 7. Sign-Error LMS update rule: avoids near-zero division that causes numerical
+#    explosion with heavily attenuated channels lacking AGC

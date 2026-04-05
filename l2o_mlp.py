@@ -13,7 +13,7 @@ from config import *
 
 from wireline_channel import WirelineChannelGenerator
 from utils import add_channel_args, get_channel_generator
-from ctle_utils import apply_serdespy_ctle
+from ctle_frequency_utils import apply_frequency_domain_ctle
 
 # ==========================================
 # 2. Differentiable Parametric CTLE
@@ -211,7 +211,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         with torch.no_grad():
             if ablate_ctle:
                 # Use continuous-time serdespy CTLE (Static LTI pre-filtering)
-                rx_init = apply_serdespy_ctle(rx_base, peaking_gain=0.5)
+                rx_init = apply_frequency_domain_ctle(rx_base, peaking_gain=0.5)
             else:
                 rx_init = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
             batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)

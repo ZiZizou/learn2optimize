@@ -13,7 +13,7 @@ from l2o_mlp import MultiRateLearnedMLP
 from l2o_mlp_no_agc import MultiRateLearnedMLPNoAGC
 from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe
 from utils import add_channel_args, get_channel_generator
-from ctle_utils import apply_serdespy_ctle
+from ctle_frequency_utils import apply_frequency_domain_ctle
 
 def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100, seq_len=500, ctle_peaking=0.5, ablate_ctle=False):
     """
@@ -29,7 +29,7 @@ def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100,
     with torch.no_grad():
         if ablate_ctle:
             # Use continuous-time serdespy CTLE (Static LTI pre-filtering)
-            rx_init = apply_serdespy_ctle(rx_base, peaking_gain=ctle_peaking)
+            rx_init = apply_frequency_domain_ctle(rx_base, peaking_gain=ctle_peaking)
         else:
             rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
         batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
@@ -264,7 +264,7 @@ if __name__ == "__main__":
 
     if ablate_ctle:
         print("Applying continuous-time SerDesPy CTLE for evaluation...")
-        rx_init = apply_serdespy_ctle(rx_base, peaking_gain=ctle_peaking)
+        rx_init = apply_frequency_domain_ctle(rx_base, peaking_gain=ctle_peaking)
     else:
         rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
