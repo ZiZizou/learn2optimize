@@ -492,9 +492,11 @@ if __name__ == "__main__":
     common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
     print(f"Synchronized main cursor at delay (median): {common_delay}")
 
-    # Align rx and tx using the common delay
+    # rx_aligned drops the startup delay so index 0 corresponds to tx[0]
     rx_aligned = rx_ctle[:, common_delay:]
-    tx_aligned = tx[:, common_delay:]
+
+    # tx starts at index 0, but we must truncate the end so lengths match
+    tx_aligned = tx[:, :rx_aligned.shape[1]]
 
     print(f"Aligned sequence length: {tx_aligned.shape[1]}")
     print("-" * 30)

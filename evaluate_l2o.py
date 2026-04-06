@@ -273,9 +273,11 @@ if __name__ == "__main__":
     batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
     common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
 
-    # Align data using common delay (same as L2O evaluation)
-    tx_aligned = tx_symbols[:, common_delay:]
+    # rx_aligned drops the startup delay so index 0 corresponds to tx_symbols[0]
     rx_aligned = rx_init[:, common_delay:]
+
+    # tx_symbols starts at index 0, but we must truncate the end so lengths match
+    tx_aligned = tx_symbols[:, :rx_aligned.shape[1]]
 
     print(f"Batch size: {batch_size}, Common delay: {common_delay}")
     print(f"Aligned sequence length: {tx_aligned.shape[1]}")
