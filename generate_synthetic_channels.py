@@ -63,6 +63,11 @@ def extract_and_resample_ir(filepath: pathlib.Path, num_taps: int = CH_TAPS) -> 
     # Read the network
     network = skrf.Network(str(filepath))
 
+    # Extrapolate to DC if needed to avoid IFFT distortion
+    # VNA measurements often lack a true DC bin, causing non-causal ringing
+    if network.frequency.f[0] != 0:
+        network = network.extrapolate_to_dc()
+
     # Extract S21 (forward transmission from port 1 to port 2)
     # For differential THRU channels, S21 represents the differential insertion loss
     if network.number_of_ports == 4:
@@ -76,12 +81,7 @@ def extract_and_resample_ir(filepath: pathlib.Path, num_taps: int = CH_TAPS) -> 
 
     # Get frequency info
     freq = network.frequency
-    f = freq.f
     n = len(s21)
-
-    # Check if frequency starts at 0
-    if f[0] != 0:
-        print(f"  Warning: Frequency doesn't start at 0 Hz for {filepath.name}, results may be distorted")
 
     # Compute impulse response using IFFT
     # IFFT of S21 gives the time-domain impulse response
@@ -363,9 +363,10 @@ def augment_reflections(
     """
     Random Reflection (Impedance Mismatch): Injects discrete spikes into post-cursor tail.
 
-    Physics-based correction: Reflection amplitude is now scaled by the main cursor
+    Vectorized implementation using scatter_add_ for GPU-efficient batch processing.
+    Physics-based correction: Reflection amplitude is scaled by the main cursor
     (peak amplitude) of each channel, ensuring the reflection coefficient Gamma
-    remains bounded. A reflection cannot exceed the incident signal amplitude.
+    remains bounded.
 
     Args:
         h_batch: Batch of channels [batch_size, num_taps]
@@ -378,18 +379,26 @@ def augment_reflections(
     """
     h_aug = h_batch.clone()
     batch_size, num_taps = h_aug.shape
+    device = h_aug.device
 
-    for i in range(batch_size):
-        # Find the main cursor amplitude for this specific channel
-        # This ensures reflections are bounded by the actual signal energy
-        peak_amp = torch.max(torch.abs(h_aug[i]))
+    # 1. Find peak amplitudes for the entire batch: shape [batch_size, 1]
+    peak_amps = torch.max(torch.abs(h_aug), dim=1, keepdim=True)[0]
 
-        num_refs = torch.randint(1, max_refs + 1, (1,)).item()
-        for _ in range(num_refs):
-            idx = torch.randint(min_idx, num_taps, (1,)).item()
-            # Scale reflection by peak amplitude (physically bounded Gamma)
-            amp_ratio = torch.empty(1).uniform_(-max_ratio, max_ratio).item()
-            h_aug[i, idx] += amp_ratio * peak_amp
+    # 2. Generate random number of reflections per channel: shape [batch_size, 1]
+    num_refs = torch.randint(1, max_refs + 1, (batch_size, 1), device=device)
+
+    # 3. Create indices and amplitude ratios: shape [batch_size, max_refs]
+    indices = torch.randint(min_idx, num_taps, (batch_size, max_refs), device=device)
+    amp_ratios = torch.empty((batch_size, max_refs), device=device).uniform_(-max_ratio, max_ratio)
+
+    # 4. Create a mask to zero out padding reflections (variable count per channel)
+    # arange shape [max_refs], broadcast against num_refs
+    mask = torch.arange(max_refs, device=device).expand(batch_size, max_refs) < num_refs
+    amp_ratios = amp_ratios * mask
+
+    # 5. Scale by peak amplitudes and add to channel using scatter_add_
+    scaled_amps = amp_ratios * peak_amps
+    h_aug.scatter_add_(1, indices, scaled_amps)
 
     return h_aug / (torch.norm(h_aug, dim=1, keepdim=True) + 1e-8)
 
@@ -400,12 +409,14 @@ def augment_mixup(
     lam_range: tuple = (0.2, 0.8)
 ) -> torch.Tensor:
     """
-    Mixup: Phase-aligned linear interpolation between two channels for regularization.
+    Mixup: Vectorized phase-aligned linear interpolation between two channels.
 
-    Physics-based correction: Standard mixup can create invalid multi-drop topologies
-    when channels have different "flight times" (main cursor at different indices).
-    This version phase-aligns channels before interpolation so the result represents
-    a valid point-to-point link, not a multi-path channel.
+    Vectorized implementation using torch.gather with modulo indexing for
+    GPU-efficient batch processing. Physics-based correction: Standard mixup
+    can create invalid multi-drop topologies when channels have different
+    "flight times" (main cursor at different indices). This version phase-aligns
+    channels before interpolation so the result represents a valid point-to-point
+    link, not a multi-path channel.
 
     h_new = lambda * h_batch + (1 - lambda) * h_random (aligned)
 
@@ -417,39 +428,38 @@ def augment_mixup(
     Returns:
         Augmented batch of same shape [batch_size, num_taps]
     """
-    batch_size = h_batch.shape[0]
+    batch_size, num_taps = h_batch.shape
+    device = h_batch.device
 
     # Sample random channels from thru_pool
-    indices = torch.randint(0, len(thru_pool), (batch_size,))
-    h_random = thru_pool[indices]
+    indices = torch.randint(0, len(thru_pool), (batch_size,), device=device)
+    h_random = thru_pool[indices].clone()
 
-    # Phase-align h_random to h_batch before mixing
-    for i in range(batch_size):
-        # Find main cursors (peak locations) in both channels
-        idx_batch = torch.argmax(torch.abs(h_batch[i]))
-        idx_random = torch.argmax(torch.abs(h_random[i]))
+    # 1. Batch argmax for main cursors: shape [batch_size]
+    idx_batch = torch.argmax(torch.abs(h_batch), dim=1)
+    idx_random = torch.argmax(torch.abs(h_random), dim=1)
 
-        # Calculate shift to align h_random's peak to h_batch's peak
-        shift = (idx_batch - idx_random).item()
+    # Calculate shifts: shape [batch_size, 1]
+    shifts = (idx_batch - idx_random).unsqueeze(1)
 
-        # Roll to shift (positive shift = delay, negative = advance)
-        h_random_aligned = torch.roll(h_random[i], shifts=shift, dims=0)
+    # 2. Create base index grid: shape [batch_size, num_taps]
+    base_idx = torch.arange(num_taps, device=device).unsqueeze(0).expand(batch_size, num_taps)
 
-        # Zero out wrapped-around artifacts to maintain causality
-        if shift > 0:
-            # Delayed: zeros at the beginning (causal)
-            h_random_aligned[:shift] = 0.0
-        elif shift < 0:
-            # Advanced: zeros at the end (causal)
-            h_random_aligned[shift:] = 0.0
+    # 3. Calculate shifted indices with modulo wrap-around
+    unmod_idx = base_idx - shifts
+    gather_idx = unmod_idx % num_taps
 
-        h_random[i] = h_random_aligned
+    # Apply shift using gather (vectorized roll)
+    h_random_aligned = torch.gather(h_random, 1, gather_idx)
 
-    # Random lambda uniformly sampled
-    lam = torch.empty(batch_size, 1).uniform_(lam_range[0], lam_range[1])
+    # 4. Mask out the wrapped artifacts to maintain causality
+    # Any position where unmod_idx is out of bounds had wrapped values
+    artifact_mask = (unmod_idx < 0) | (unmod_idx >= num_taps)
+    h_random_aligned = h_random_aligned.masked_fill(artifact_mask, 0.0)
 
-    # Linear interpolation on phase-aligned tensors
-    h_aug = lam * h_batch + (1.0 - lam) * h_random
+    # 5. Linear interpolation on phase-aligned tensors
+    lam = torch.empty((batch_size, 1), device=device).uniform_(lam_range[0], lam_range[1])
+    h_aug = lam * h_batch + (1.0 - lam) * h_random_aligned
 
     return h_aug / (torch.norm(h_aug, dim=1, keepdim=True) + 1e-8)
 
