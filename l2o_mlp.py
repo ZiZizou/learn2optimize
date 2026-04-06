@@ -369,10 +369,14 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     step_mse = torch.mean(e_t ** 2)
                     loss += step_mse
 
+                    # L1 Penalty on the step size to force lazy convergence at steady-state
+                    # Higher mu_penalty → faster decay to zero step size
+                    loss += L2O_MU_PENALTY * torch.mean(torch.abs(mu_dfe))
+
                     # OVERDRIVE PENALTY: Heavily penalize the network for using the overdrive head
                     # This forces mu_overdrive to collapse to 0 during steady-state tracking
                     if learned_opt.use_two_head:
-                        loss += 0.01 * torch.mean(mu_overdrive ** 2)
+                        loss += L2O_OVERDRIVE_PENALTY * torch.mean(mu_overdrive ** 2)
 
                     epoch_total_mse += step_mse.item()
                     num_steps += 1
