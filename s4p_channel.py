@@ -174,7 +174,8 @@ class S4pChannelGenerator:
                         tx_aggressor.unsqueeze(0),
                         h_fext_reshaped
                     )
-                    rx_total[i] += rx_fext[i]
+                    # rx_fext has shape [1, output_len], index with [0] not [i]
+                    rx_total[i] += rx_fext[0]
 
             # Handle NEXT (Near-End Crosstalk)
             if channel_dict.get('next') is not None:
@@ -191,7 +192,8 @@ class S4pChannelGenerator:
                         tx_aggressor.unsqueeze(0),
                         h_next_reshaped
                     )
-                    rx_total[i] += rx_next[i]
+                    # rx_next has shape [1, output_len], index with [0] not [i]
+                    rx_total[i] += rx_next[0]
 
         # 3. Add AWGN
         snr_db = torch.empty(batch_size_actual).uniform_(
