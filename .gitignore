@@ -45,3 +45,4 @@ wireline_s4p_models
 temp_process
 *.pt
 scratchpad.md
+processed_802_3ck/*
