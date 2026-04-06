@@ -357,16 +357,20 @@ def augment_il_tilt(
 def augment_reflections(
     h_batch: torch.Tensor,
     max_refs: int = 3,
-    max_amp: float = 0.15,
+    max_ratio: float = 0.15,
     min_idx: int = 10
 ) -> torch.Tensor:
     """
     Random Reflection (Impedance Mismatch): Injects discrete spikes into post-cursor tail.
 
+    Physics-based correction: Reflection amplitude is now scaled by the main cursor
+    (peak amplitude) of each channel, ensuring the reflection coefficient Gamma
+    remains bounded. A reflection cannot exceed the incident signal amplitude.
+
     Args:
         h_batch: Batch of channels [batch_size, num_taps]
         max_refs: Maximum number of reflections to inject per channel
-        max_amp: Maximum amplitude of reflection spikes
+        max_ratio: Maximum reflection coefficient (e.g., 0.15 = max 15% of peak)
         min_idx: Minimum index for reflection placement (post-cursor region)
 
     Returns:
@@ -376,11 +380,16 @@ def augment_reflections(
     batch_size, num_taps = h_aug.shape
 
     for i in range(batch_size):
+        # Find the main cursor amplitude for this specific channel
+        # This ensures reflections are bounded by the actual signal energy
+        peak_amp = torch.max(torch.abs(h_aug[i]))
+
         num_refs = torch.randint(1, max_refs + 1, (1,)).item()
         for _ in range(num_refs):
             idx = torch.randint(min_idx, num_taps, (1,)).item()
-            amp = torch.empty(1).uniform_(-max_amp, max_amp).item()
-            h_aug[i, idx] += amp
+            # Scale reflection by peak amplitude (physically bounded Gamma)
+            amp_ratio = torch.empty(1).uniform_(-max_ratio, max_ratio).item()
+            h_aug[i, idx] += amp_ratio * peak_amp
 
     return h_aug / (torch.norm(h_aug, dim=1, keepdim=True) + 1e-8)
 
@@ -391,9 +400,14 @@ def augment_mixup(
     lam_range: tuple = (0.2, 0.8)
 ) -> torch.Tensor:
     """
-    Mixup: Linear interpolation between two channels for regularization.
+    Mixup: Phase-aligned linear interpolation between two channels for regularization.
 
-    h_new = lambda * h_batch + (1 - lambda) * h_random
+    Physics-based correction: Standard mixup can create invalid multi-drop topologies
+    when channels have different "flight times" (main cursor at different indices).
+    This version phase-aligns channels before interpolation so the result represents
+    a valid point-to-point link, not a multi-path channel.
+
+    h_new = lambda * h_batch + (1 - lambda) * h_random (aligned)
 
     Args:
         h_batch: Batch of THRU channels [batch_size, num_taps]
@@ -409,10 +423,32 @@ def augment_mixup(
     indices = torch.randint(0, len(thru_pool), (batch_size,))
     h_random = thru_pool[indices]
 
+    # Phase-align h_random to h_batch before mixing
+    for i in range(batch_size):
+        # Find main cursors (peak locations) in both channels
+        idx_batch = torch.argmax(torch.abs(h_batch[i]))
+        idx_random = torch.argmax(torch.abs(h_random[i]))
+
+        # Calculate shift to align h_random's peak to h_batch's peak
+        shift = (idx_batch - idx_random).item()
+
+        # Roll to shift (positive shift = delay, negative = advance)
+        h_random_aligned = torch.roll(h_random[i], shifts=shift, dims=0)
+
+        # Zero out wrapped-around artifacts to maintain causality
+        if shift > 0:
+            # Delayed: zeros at the beginning (causal)
+            h_random_aligned[:shift] = 0.0
+        elif shift < 0:
+            # Advanced: zeros at the end (causal)
+            h_random_aligned[shift:] = 0.0
+
+        h_random[i] = h_random_aligned
+
     # Random lambda uniformly sampled
     lam = torch.empty(batch_size, 1).uniform_(lam_range[0], lam_range[1])
 
-    # Linear interpolation
+    # Linear interpolation on phase-aligned tensors
     h_aug = lam * h_batch + (1.0 - lam) * h_random
 
     return h_aug / (torch.norm(h_aug, dim=1, keepdim=True) + 1e-8)

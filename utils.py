@@ -10,6 +10,7 @@ import torch
 
 from wireline_channel import WirelineChannelGenerator
 from advanced_channel_gen import AdvancedWirelineChannelGenerator
+from s4p_channel import S4pChannelGenerator
 from config import CH_TAPS, SNR_RANGE
 
 
@@ -39,6 +40,14 @@ def add_channel_args(parser: argparse.ArgumentParser):
              "impulse responses preserve true insertion loss physics with raw, attenuated "
              "voltages rather than being normalized to unit peak/L2 norm."
     )
+    parser.add_argument(
+        "--touchstone_channel",
+        type=str,
+        default=None,
+        help="Path to the .pt file containing processed S4P channel dictionaries. "
+             "If provided, overrides standard synthetic channels with realistic S-parameter "
+             "derived channel data including FEXT/NEXT crosstalk."
+    )
     return parser
 
 
@@ -51,9 +60,19 @@ def get_channel_generator(args, device=None):
         device: Optional torch device to pass to the advanced generator.
 
     Returns:
-        WirelineChannelGenerator or AdvancedWirelineChannelGenerator instance.
+        WirelineChannelGenerator, AdvancedWirelineChannelGenerator, or
+        S4pChannelGenerator instance.
     """
     disable_agc = getattr(args, 'disable_agc', False)
+
+    # S4P Touchstone channel overrides other channel types
+    if getattr(args, 'touchstone_channel', None) is not None:
+        return S4pChannelGenerator(
+            touchstone_file_path=args.touchstone_channel,
+            snr_range=SNR_RANGE,
+            disable_agc=disable_agc
+        )
+
     if args.channel_type == "advanced":
         return AdvancedWirelineChannelGenerator(
             num_taps=CH_TAPS,
