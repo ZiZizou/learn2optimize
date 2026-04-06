@@ -128,14 +128,14 @@ class S4pChannelGenerator:
         h_thru_list = []
         max_taps = 0
         for d in sampled_dicts:
-            h_thru_list.append(d['thru'])
-            max_taps = max(max_taps, d['thru'].shape[-1])
+            # Ensure thru is 1D
+            h_thru_1d = d['thru'].flatten()
+            h_thru_list.append(h_thru_1d)
+            max_taps = max(max_taps, h_thru_1d.shape[-1])
 
         # Pad thru tensors to same length if needed
         h_thru_padded = []
         for h in h_thru_list:
-            if h.dim() == 1:
-                h = h.unsqueeze(0)  # [1, num_taps]
             if h.shape[-1] < max_taps:
                 h = F.pad(h, (0, max_taps - h.shape[-1]))
             h_thru_padded.append(h)
@@ -166,8 +166,9 @@ class S4pChannelGenerator:
                     tx_aggressor = self._generate_aggressor_bits(seq_len)
 
                     # Convolve with FEXT impulse response
-                    h_fext_tensor = h_fext.unsqueeze(0) if h_fext.dim() == 1 else h_fext
-                    h_fext_reshaped = h_fext_tensor.unsqueeze(1)  # [1, 1, num_taps]
+                    # Ensure h_fext is at least 1D, then reshape to [1, 1, num_taps]
+                    h_fext_1d = h_fext.flatten()
+                    h_fext_reshaped = h_fext_1d.unsqueeze(0).unsqueeze(1)  # [1, 1, num_taps]
 
                     rx_fext = self._convolve_1d(
                         tx_aggressor.unsqueeze(0),
@@ -182,8 +183,9 @@ class S4pChannelGenerator:
                     tx_aggressor = self._generate_aggressor_bits(seq_len)
 
                     # Convolve with NEXT impulse response
-                    h_next_tensor = h_next.unsqueeze(0) if h_next.dim() == 1 else h_next
-                    h_next_reshaped = h_next_tensor.unsqueeze(1)  # [1, 1, num_taps]
+                    # Ensure h_next is at least 1D, then reshape to [1, 1, num_taps]
+                    h_next_1d = h_next.flatten()
+                    h_next_reshaped = h_next_1d.unsqueeze(0).unsqueeze(1)  # [1, 1, num_taps]
 
                     rx_next = self._convolve_1d(
                         tx_aggressor.unsqueeze(0),
