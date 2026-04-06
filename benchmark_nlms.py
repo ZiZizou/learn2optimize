@@ -559,9 +559,13 @@ if __name__ == "__main__":
     # )
 
     # 5. Run RLS DFE (optimal linear upper bound) - using batch wrapper
+    # Dynamically scale delta based on signal variance for better RLS initialization
+    signal_variance = torch.var(rx_aligned).item()
+    dynamic_delta = RLS_DELTA * signal_variance
+    print(f"Signal Variance: {signal_variance:.6f}, Dynamic RLS Delta: {dynamic_delta:.6e}")
     avg_mse_history_rls, final_w_rls = run_batch_rls_dfe(
         rx_aligned, tx_aligned, num_taps=DFE_TAPS,
-        lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=False
+        lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False
     )
 
     # Acquisition vs Steady-State for RLS

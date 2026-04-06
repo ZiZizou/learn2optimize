@@ -183,9 +183,11 @@ if __name__ == "__main__":
                         help="Enable ablation mode for models trained with ABLATE_CTLE=True")
     parser.add_argument("--two_head", action="store_true",
                         help="Evaluate models trained with two-head overdrive architecture")
-    parser.add_argument("--model_path", type=str, default=None,
-                        help="Path to a specific trained model file. If not provided, "
-                             "auto-generates paths based on channel_type and ablation settings.")
+    parser.add_argument("--model_path", type=str, action="append", default=None,
+                        dest="model_paths",
+                        help="Path to a specific trained model file. Can be specified multiple times "
+                             "for multiple models. If not provided, auto-generates paths based on "
+                             "channel_type and ablation settings.")
     # Strategy selection flags (default all to True for backward compatibility)
     parser.add_argument("--include_l2o", action="store_true", default=True,
                         help="Include L2O models in evaluation (default: True)")
@@ -219,7 +221,7 @@ if __name__ == "__main__":
     burn_in = args.burn_in
     ctle_peaking = args.ctle_peaking
     ablate_ctle = args.ablate_ctle
-    model_path = args.model_path
+    model_paths = args.model_paths
 
     # Process strategy selection flags
     include_l2o = args.include_l2o and not args.no_l2o
@@ -247,7 +249,10 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     print("Starting Comparative Evaluation (Inference Mode)...")
     print(f"Settings: batch_size={batch_size}, seq_len={seq_len}, burn_in={burn_in}")
-    print(f"Channel type: {args.channel_type}")
+    if args.touchstone_channel:
+        print(f"Channel type: S4P Touchstone ({args.touchstone_channel})")
+    else:
+        print(f"Channel type: {args.channel_type}")
     if args.disable_agc:
         print("*** NO-AGC MODE: Channel normalization disabled - evaluating with raw physics-preserved voltages ***")
     if ablate_ctle:
@@ -294,24 +299,26 @@ if __name__ == "__main__":
     suffix = "_ablate_ctle" if ablate_ctle else ""
     ablate_label = " (Ablated)" if ablate_ctle else ""
 
-    if model_path:
-        # Use the explicitly provided model path
-        model_type = "rnn"  # Default, user should specify if MLP
-        if "mlp" in model_path.lower():
-            model_type = "mlp"
-        # Check if this is a no-AGC model
-        is_no_agc_model = "_no_agc" in model_path.lower()
-        # Auto-detect two-head from model filename
-        is_two_head_model = "_two_head" in model_path.lower()
-        if is_no_agc_model:
-            mlp_class = MultiRateLearnedMLPNoAGC
-        else:
-            mlp_class = MultiRateLearnedMLP
-        models_to_test = [
-            (f"Custom Model{ablate_label}", model_path, model_type,
-             mlp_class(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=is_two_head_model) if model_type == "mlp"
-             else MultiRateLearnedNLMS(6, 32, use_two_head=is_two_head_model))
-        ]
+    if model_paths:
+        # Use the explicitly provided model paths
+        models_to_test = []
+        for mp in model_paths:
+            model_type = "rnn"  # Default, user should specify if MLP
+            if "mlp" in mp.lower():
+                model_type = "mlp"
+            # Check if this is a no-AGC model
+            is_no_agc_model = "_no_agc" in mp.lower()
+            # Auto-detect two-head from model filename
+            is_two_head_model = "_two_head" in mp.lower()
+            if is_no_agc_model:
+                mlp_class = MultiRateLearnedMLPNoAGC
+            else:
+                mlp_class = MultiRateLearnedMLP
+            models_to_test.append((
+                f"Custom Model{ablate_label}", mp, model_type,
+                mlp_class(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=is_two_head_model) if model_type == "mlp"
+                else MultiRateLearnedNLMS(6, 32, use_two_head=is_two_head_model)
+            ))
     else:
         # Auto-generate paths based on channel_type and ablation settings
         two_head_suffix = "_two_head" if args.two_head else ""
@@ -409,8 +416,12 @@ if __name__ == "__main__":
 
     # RLS Bench (if enabled)
     if include_rls:
+        # Dynamically scale delta based on signal variance for better RLS initialization
+        signal_variance = torch.var(rx_aligned).item()
+        dynamic_delta = RLS_DELTA * signal_variance
+        print(f"Signal Variance: {signal_variance:.6f}, Dynamic RLS Delta: {dynamic_delta:.6e}")
         avg_mse_rls, rls_all_combined = run_batch_rls_dfe(
-            rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=RLS_DELTA, teacher_forcing=False
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False
         )
         results["RLS"] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item())
         # RLS combines FFE and DFE into one weight vector [FFE_TAPS + DFE_TAPS]

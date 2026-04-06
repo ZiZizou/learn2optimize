@@ -76,11 +76,11 @@ NLMS_MU_VALUES = [0.01, 0.05, 0.1, 0.2]  # Static mu sweep values
 # GEAR_SHIFT_EMA_ALPHA = 0.05   # Smoothing factor for error variance
 
 # Continuous Variable Step-Size (VSS) NLMS parameters
-VSS_MU_MAX = 0.2       # Upper bound (fast acquisition)
+VSS_MU_MAX = 0.5       # Upper bound (fast acquisition)
 VSS_MU_MIN = 0.005     # Lower bound (fine tracking/steady-state)
 VSS_ALPHA = 0.99       # Memory factor (close to 1 for smooth decay)
 VSS_GAMMA = 1e-3      # Error scaling factor (controls reaction to error spikes)
-VSS_MOMENTUM = 0.9     # Momentum coefficient for heavy-ball optimization (0.0 = no momentum)
+VSS_MOMENTUM = 0.0     # Momentum coefficient for heavy-ball optimization (0.0 = no momentum)
 
 # Benchmark settings
 BURN_IN = 2000          # Symbols to skip for steady-state calculation
