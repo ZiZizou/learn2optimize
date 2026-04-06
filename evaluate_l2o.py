@@ -15,16 +15,17 @@ from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe
 from utils import add_channel_args, get_channel_generator
 from ctle_frequency_utils import apply_frequency_domain_ctle
 
-def run_l2o_inference(model, model_type, channel_gen, ctle, dfe, batch_size=100, seq_len=500, ctle_peaking=0.5, ablate_ctle=False):
+def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_peaking=0.5, ablate_ctle=False):
     """
-    Evaluates a trained L2O model on a fresh batch of channels without weight updates.
+    Evaluates a trained L2O model on a pre-generated batch of channels without weight updates.
 
     Args:
+        rx_base: Pre-generated received signal tensor [batch_size, seq_len]
+        tx_symbols: Pre-generated TX symbols tensor [batch_size, seq_len]
         ablate_ctle: If True, skip CTLE updates (use fixed CTLE) to match training with ABLATE_CTLE=True
     """
     model.eval()
-    tx_symbols = torch.sign(torch.randn(batch_size, seq_len))
-    rx_base, _ = channel_gen.generate_received_signal(tx_symbols, batch_size)
+    batch_size, seq_len = tx_symbols.shape
 
     with torch.no_grad():
         if ablate_ctle:
@@ -348,7 +349,7 @@ if __name__ == "__main__":
             try:
                 model.load_state_dict(torch.load(path))
                 print(f"Loaded {name} from {path}")
-                mse_trace, w_ffe_final, dfe_final, mu_trace = run_l2o_inference(model, mtype, gen, ctle, dfe, batch_size=batch_size, seq_len=seq_len, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
+                mse_trace, w_ffe_final, dfe_final, mu_trace = run_l2o_inference(model, mtype, rx_base, tx_symbols, ctle, dfe, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
                 avg_mse = torch.mean(mse_trace).item()
                 ss_mse = torch.mean(mse_trace[burn_in:]).item()
                 ss_mu = torch.mean(mu_trace[burn_in:]).item() if len(mu_trace) > burn_in else torch.mean(mu_trace).item()
