@@ -487,17 +487,19 @@ if __name__ == "__main__":
     rx_ctle = ctle(rx_raw, peaking_gain)
 
     # 3. Delay Alignment (Synchronization via Cross-Correlation)
-    # Use common delay (median) for batch alignment
+    # Vectorized per-channel alignment - each channel shifted by its exact delay
     batch_delays = cross_correlate_sync_batch(tx, rx_ctle)
-    common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
-    print(f"Synchronized main cursor at delay (median): {common_delay}")
+    max_delay = max(batch_delays)
+    aligned_seq_len = rx_ctle.shape[1] - max_delay
 
-    # rx_aligned drops the startup delay so index 0 corresponds to tx[0]
-    rx_aligned = rx_ctle[:, common_delay:]
+    indices = torch.arange(aligned_seq_len).unsqueeze(0).expand(tx.shape[0], -1)
+    delay_tensor = torch.tensor(batch_delays).unsqueeze(1)
+    gather_indices = indices + delay_tensor
 
-    # tx starts at index 0, but we must truncate the end so lengths match
-    tx_aligned = tx[:, :rx_aligned.shape[1]]
+    rx_aligned = torch.gather(rx_ctle, 1, gather_indices)
+    tx_aligned = tx[:, :aligned_seq_len]
 
+    print(f"Synchronized main cursor - Delay range: [{min(batch_delays)}, {max_delay}], Median: {int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())}")
     print(f"Aligned sequence length: {tx_aligned.shape[1]}")
     print("-" * 30)
 

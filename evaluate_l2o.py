@@ -274,17 +274,22 @@ if __name__ == "__main__":
     else:
         rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-    # Synchronize using cross-correlation to find common delay
+    # Synchronize using cross-correlation to find per-channel delay
     batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
-    common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
 
-    # rx_aligned drops the startup delay so index 0 corresponds to tx_symbols[0]
-    rx_aligned = rx_init[:, common_delay:]
+    # Vectorized per-channel alignment using torch.gather
+    # Each channel is shifted by its exact delay, so rx_aligned[i, 0] corresponds to tx_symbols[i, 0]
+    max_delay = max(batch_delays)
+    aligned_seq_len = rx_init.shape[1] - max_delay
 
-    # tx_symbols starts at index 0, but we must truncate the end so lengths match
-    tx_aligned = tx_symbols[:, :rx_aligned.shape[1]]
+    indices = torch.arange(aligned_seq_len).unsqueeze(0).expand(batch_size, -1)
+    delay_tensor = torch.tensor(batch_delays).unsqueeze(1)
+    gather_indices = indices + delay_tensor
 
-    print(f"Batch size: {batch_size}, Common delay: {common_delay}")
+    rx_aligned = torch.gather(rx_init, 1, gather_indices)
+    tx_aligned = tx_symbols[:, :aligned_seq_len]
+
+    print(f"Batch size: {batch_size}, Delay range: [{min(batch_delays)}, {max_delay}], Median: {int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())}")
     print(f"Aligned sequence length: {tx_aligned.shape[1]}")
     print("-" * 60)
 
