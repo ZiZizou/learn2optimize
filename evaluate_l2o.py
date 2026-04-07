@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 import argparse
+import ast
 from config import *
 
 # Import architectures from training scripts
@@ -207,6 +208,10 @@ if __name__ == "__main__":
                         help="Include VSS NLMS benchmark (default: True)")
     parser.add_argument("--no_vss", action="store_true",
                         help="Exclude VSS NLMS benchmark")
+    parser.add_argument("--vss_mu_max_values", type=str, default=None,
+                        help="Comma-separated list of VSS_MU_MAX values to compare (e.g., '0.1,0.3,0.5'). Default: use VSS_MU_MAX from config")
+    parser.add_argument("--no_vss_nlms_mom", action="store_true",
+                        help="Exclude VSS NLMS with momentum from comparison")
     parser.add_argument("--include_rls", action="store_true", default=True,
                         help="Include RLS benchmark (default: True)")
     parser.add_argument("--no_rls", action="store_true",
@@ -228,6 +233,14 @@ if __name__ == "__main__":
     include_nlms = args.include_nlms and not args.no_nlms and not args.no_baseline
     include_vss = args.include_vss and not args.no_vss and not args.no_baseline
     include_rls = args.include_rls and not args.no_rls and not args.no_baseline
+
+    # Parse VSS MU_MAX values for comparison
+    if args.vss_mu_max_values is not None:
+        vss_mu_max_values = ast.literal_eval(args.vss_mu_max_values)
+        if isinstance(vss_mu_max_values, (int, float)):
+            vss_mu_max_values = [vss_mu_max_values]
+    else:
+        vss_mu_max_values = [VSS_MU_MAX]  # Default: single value from config
 
     # L2O model exclusion flags
     exclude_rnn_basic = args.no_rnn_basic
@@ -394,32 +407,43 @@ if __name__ == "__main__":
         smoothed_nlms = pd.Series(avg_mse_nlms.numpy()).ewm(span=20).mean()
         plt.plot(10 * torch.log10(torch.tensor(smoothed_nlms)), '--', label="NLMS mu=0.05", alpha=0.6)
 
-    # VSS NLMS Bench (if enabled)
+    # VSS NLMS Bench (if enabled) - loop over all VSS_MU_MAX values
     if include_vss:
-        avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss = run_batch_nlms_dfe(
-            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
-            use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
-            vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA
-        )
-        results["NLMS (VSS)"] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item())
-        all_ffe_weights["NLMS (VSS)"] = vss_all_ffe
-        all_dfe_weights["NLMS (VSS)"] = vss_all_dfe
-        step_size_history["NLMS (VSS)"] = mu_vss
-        smoothed_vss = pd.Series(avg_mse_vss.numpy()).ewm(span=20).mean()
-        plt.plot(10 * torch.log10(torch.tensor(smoothed_vss)), 'b--', label="NLMS Continuous VSS", alpha=0.6)
+        # Define line styles/colors for up to 6 configurations
+        line_styles = ['--', ':', '-.', '--', ':', '-.']
+        colors = ['b', 'm', 'g', 'c', 'orange', 'purple']
+        for idx, vss_mu_max_val in enumerate(vss_mu_max_values):
+            style = line_styles[idx % len(line_styles)]
+            color = colors[idx % len(colors)]
+            label_vss = f"NLMS VSS (μ_max={vss_mu_max_val})"
+            label_vss_mom = f"NLMS VSS (μ_max={vss_mu_max_val}, Mom={VSS_MOMENTUM})"
 
-        # VSS NLMS with Momentum Bench (if enabled)
-        avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe, mu_vss_mom = run_batch_nlms_dfe(
-            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
-            use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
-            vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM
-        )
-        results["NLMS (VSS+Mom)"] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item())
-        all_ffe_weights["NLMS (VSS+Mom)"] = vss_mom_all_ffe
-        all_dfe_weights["NLMS (VSS+Mom)"] = vss_mom_all_dfe
-        step_size_history["NLMS (VSS+Mom)"] = mu_vss_mom
-        smoothed_vss_mom = pd.Series(avg_mse_vss_mom.numpy()).ewm(span=20).mean()
-        plt.plot(10 * torch.log10(torch.tensor(smoothed_vss_mom)), 'm:', label=f"NLMS Continuous VSS (Mom={VSS_MOMENTUM})", alpha=0.6)
+            # VSS NLMS (no momentum)
+            avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss = run_batch_nlms_dfe(
+                rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
+                use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
+                vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA
+            )
+            results[label_vss] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item())
+            all_ffe_weights[label_vss] = vss_all_ffe
+            all_dfe_weights[label_vss] = vss_all_dfe
+            step_size_history[label_vss] = mu_vss
+            smoothed_vss = pd.Series(avg_mse_vss.numpy()).ewm(span=20).mean()
+            plt.plot(10 * torch.log10(torch.tensor(smoothed_vss)), f'{color}{style}', label=label_vss, alpha=0.6)
+
+            # VSS NLMS with Momentum (if momentum is enabled and not suppressed)
+            if VSS_MOMENTUM != 0.0 and not args.no_vss_nlms_mom:
+                avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe, mu_vss_mom = run_batch_nlms_dfe(
+                    rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
+                    use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
+                    vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM
+                )
+                results[label_vss_mom] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item())
+                all_ffe_weights[label_vss_mom] = vss_mom_all_ffe
+                all_dfe_weights[label_vss_mom] = vss_mom_all_dfe
+                step_size_history[label_vss_mom] = mu_vss_mom
+                smoothed_vss_mom = pd.Series(avg_mse_vss_mom.numpy()).ewm(span=20).mean()
+                plt.plot(10 * torch.log10(torch.tensor(smoothed_vss_mom)), f'{color}{style}', label=label_vss_mom, alpha=0.6)
 
     # RLS Bench (if enabled)
     if include_rls:
@@ -439,27 +463,27 @@ if __name__ == "__main__":
 
     # Final Reporting
     print("\nComparison Table (Evaluation on {} symbols, batch-avg):".format(seq_len))
-    print(f"{'Method':<20} | {'Avg MSE (dB)':<15} | {'SS MSE (dB)':<15}")
-    print("-" * 55)
+    print(f"{'Method':<35} | {'Avg MSE (dB)':<15} | {'SS MSE (dB)':<15}")
+    print("-" * 70)
     for name, (avg, ss) in results.items():
-        print(f"{name:<20} | {10*np.log10(avg):>12.2f} dB | {10*np.log10(ss):>12.2f} dB")
+        print(f"{name:<35} | {10*np.log10(avg):>12.2f} dB | {10*np.log10(ss):>12.2f} dB")
 
     # Step Size Summary
-    print("\n" + "="*60)
+    print("\n" + "="*75)
     print("Step Size Summary (averaged over steady-state, symbols {} onwards):".format(burn_in))
-    print("="*60)
-    print(f"{'Method':<20} | {'Avg SS Step Size':<15} | {'Final SS Step Size':<18}")
-    print("-" * 60)
+    print("="*75)
+    print(f"{'Method':<35} | {'Avg SS Step Size':<15} | {'Final SS Step Size':<18}")
+    print("-" * 75)
     for name in results.keys():
         if name in step_size_history:
             mu_trace = step_size_history[name]
             avg_ss_mu = torch.mean(mu_trace[burn_in:]).item() if len(mu_trace) > burn_in else torch.mean(mu_trace).item()
             final_ss_mu = mu_trace[-1].item() if len(mu_trace) > 0 else 0.0
-            print(f"{name:<20} | {avg_ss_mu:<15.6f} | {final_ss_mu:<18.6f}")
+            print(f"{name:<35} | {avg_ss_mu:<15.6f} | {final_ss_mu:<18.6f}")
         elif name == "RLS":
-            print(f"{name:<20} | {'N/A (RLS)':<15} | {'N/A (forgetting λ)':<18}")
+            print(f"{name:<35} | {'N/A (RLS)':<15} | {'N/A (forgetting λ)':<18}")
         else:
-            print(f"{name:<20} | {'N/A':<15} | {'N/A':<18}")
+            print(f"{name:<35} | {'N/A':<15} | {'N/A':<18}")
 
     # Print final FFE and DFE taps for each method (show 2-3 example channels)
     print("\nFinal Equalizer Taps (2-3 example channels):")
