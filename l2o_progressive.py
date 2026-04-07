@@ -121,7 +121,7 @@ class DifferentiableDFE(nn.Module):
 # 2. Multi-Rate Learned Optimizer
 # ==========================================
 class MultiRateLearnedNLMS(nn.Module):
-    def __init__(self, state_dim=5, hidden_dim=32, use_two_head=False):
+    def __init__(self, state_dim=L2O_STATE_DIM, hidden_dim=L2O_HIDDEN_DIM, use_two_head=False):
         super().__init__()
         # State: [e_t, EMA_t, norm(X), current_mu_dfe, current_peaking]
         self.rnn = nn.GRUCell(state_dim, hidden_dim)
@@ -269,7 +269,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
         common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
 
-        hidden_state = torch.zeros(batch_size, 32)
+        hidden_state = torch.zeros(batch_size, L2O_HIDDEN_DIM)
         dfe_weights = torch.zeros(batch_size, dfe.num_taps)
 
         # Prompt 2: Integrate Multi-Tap FFE
@@ -323,7 +323,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     rx_eq = rx_init[:, (t + common_delay):(t + common_delay + 1)]
 
                     # CTLE is static; use fixed peaking gain
-                    ctle_peaking = torch.tensor(0.5, device=latent_peaking.device)
+                    ctle_peaking = torch.full((batch_size, 1), 0.5, device=latent_peaking.device)
                 else:
                     rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
 
@@ -414,10 +414,10 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     step_mse = torch.mean(e_t ** 2)
                     loss += step_mse
 
-                    # OVERDRIVE PENALTY: Heavily penalize the network for using the overdrive head
-                    # This forces mu_overdrive to collapse to 0 during steady-state tracking
+                    # OVERDRIVE PENALTY: Penalize the network for using the overdrive head
+                    # This encourages overdrive to collapse to 0 during steady-state tracking
                     if learned_opt.use_two_head:
-                        loss += 0.01 * torch.mean(mu_overdrive ** 2)
+                        loss += L2O_OVERDRIVE_PENALTY * torch.mean(mu_overdrive ** 2)
 
                     epoch_total_mse += step_mse.item()
                     num_steps += 1
@@ -497,7 +497,7 @@ if __name__ == "__main__":
     channel_gen = get_channel_generator(args)
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
-    learned_opt = MultiRateLearnedNLMS(state_dim=6, hidden_dim=32, use_two_head=args.two_head)
+    learned_opt = MultiRateLearnedNLMS(state_dim=L2O_STATE_DIM, hidden_dim=L2O_HIDDEN_DIM, use_two_head=args.two_head)
 
     print(f"Channel type: {args.channel_type}")
     print(f"Channel taps: {CH_TAPS}")
