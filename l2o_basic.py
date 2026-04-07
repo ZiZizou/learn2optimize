@@ -299,7 +299,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     rx_eq = rx_init[:, (t + common_delay):(t + common_delay + 1)]
 
                     # CTLE is static; use fixed peaking gain
-                    ctle_peaking = torch.tensor(0.5, device=latent_peaking.device)
+                    ctle_peaking = torch.full((batch_size, 1), 0.5, device=latent_peaking.device)
                 else:
                     rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
 
