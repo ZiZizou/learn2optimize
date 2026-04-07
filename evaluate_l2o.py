@@ -364,6 +364,8 @@ if __name__ == "__main__":
                 model.load_state_dict(torch.load(path))
                 print(f"Loaded {name} from {path}")
                 mse_trace, w_ffe_final, dfe_final, mu_trace = run_l2o_inference(model, mtype, rx_base, tx_symbols, ctle, dfe, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
+                max_acq_mu = torch.max(mu_trace[:50]).item()
+                print(f"Max Step Size during Acquisition: {max_acq_mu:.4f}")
                 avg_mse = torch.mean(mse_trace).item()
                 ss_mse = torch.mean(mse_trace[burn_in:]).item()
                 ss_mu = torch.mean(mu_trace[burn_in:]).item() if len(mu_trace) > burn_in else torch.mean(mu_trace).item()
