@@ -57,7 +57,7 @@ def _compute_analog_response(peaking_gain_db, fc, fs, seq_len, device):
     return H_s
 
 
-def apply_frequency_domain_ctle(rx_base, peaking_gain=0.5, fs=1.0, fc=0.25):
+def apply_frequency_domain_ctle(rx_base, peaking_gain=0.5, fs=None, samples_per_symbol=1, fc=0.25):
     """
     Applies a continuous-time CTLE filter to a batch of received signals
     using parallelized frequency-domain processing.
@@ -69,8 +69,9 @@ def apply_frequency_domain_ctle(rx_base, peaking_gain=0.5, fs=1.0, fc=0.25):
     Parameters:
         rx_base: [batch_size, seq_len] PyTorch tensor - received signal before CTLE
         peaking_gain: float in [0, 1], controls the CTLE peaking amount
-        fs: Sampling frequency (normalized, default: 1.0)
-        fc: Normalized corner frequency (relative to fs, default: 0.25)
+        fs: Sampling frequency (normalized, default: None). Deprecated, use samples_per_symbol.
+        samples_per_symbol: Number of samples per symbol for frequency axis (default: 1)
+        fc: Corner frequency in cycles/symbol (default: 0.25)
 
     Returns:
         rx_filtered: [batch_size, seq_len] PyTorch float32 tensor after CTLE filtering
@@ -78,11 +79,15 @@ def apply_frequency_domain_ctle(rx_base, peaking_gain=0.5, fs=1.0, fc=0.25):
     seq_len = rx_base.shape[1]
     device = rx_base.device
 
+    if fs is None:
+        fs = float(samples_per_symbol)
+
+    f_bins = torch.fft.rfftfreq(seq_len, d=1.0 / fs).to(device)
+
     # Map peaking_gain [0, 1] to CTLE peaking in dB [0, 12]
-    # Typical SerDes CTLE provides 0-12 dB of peaking
     peaking_gain_db = peaking_gain * 12.0
 
-    # Retrieve complex transfer function evaluated at FFT bins
+    # Evaluate analog transfer function at FFT bins
     H_s = _compute_analog_response(peaking_gain_db, fc, fs, seq_len, device)
 
     # Transform entire batch to frequency domain (parallel across batch)

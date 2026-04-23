@@ -27,7 +27,7 @@ class S4pChannelGenerator:
     independent crosstalk from each aggressor.
     """
 
-    def __init__(self, touchstone_file_path, snr_range=(15, 25), disable_agc=False):
+    def __init__(self, touchstone_file_path, snr_range=(15, 25), disable_agc=False, samples_per_symbol=1):
         """
         Initialize the S4P channel generator.
 
@@ -37,10 +37,18 @@ class S4pChannelGenerator:
             snr_range: Tuple of (min_snr_db, max_snr_db) for AWGN.
             disable_agc: If True, bypasses peak normalization to preserve
                         true insertion loss physics.
+            samples_per_symbol: Number of samples per symbol (not yet supported for S4P).
         """
         self.touchstone_file_path = touchstone_file_path
         self.snr_range = snr_range
         self.disable_agc = disable_agc
+        self.samples_per_symbol = samples_per_symbol
+
+        if self.samples_per_symbol != 1:
+            raise NotImplementedError(
+                "S4P oversampling requires regenerating the impulse "
+                "response at the target sample rate."
+            )
 
         # Load the pre-processed channel dataset
         self.dataset = torch.load(touchstone_file_path)

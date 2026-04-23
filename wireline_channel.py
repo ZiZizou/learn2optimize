@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 class WirelineChannelGenerator:
-    def __init__(self, num_taps=50, snr_range=(15, 25), disable_agc=False):
+    def __init__(self, num_taps=50, snr_range=(15, 25), disable_agc=False, samples_per_symbol=1):
         """
         Generates channels with lengths of 20-50 taps
         and AWGN with SNR of 15-25 dB[cite: 55].
@@ -18,15 +18,16 @@ class WirelineChannelGenerator:
         Args:
             disable_agc: If True, bypasses L2/peak normalization to preserve
                         true insertion loss physics (raw attenuated voltages).
+            samples_per_symbol: Number of samples per symbol for channel time grid.
         """
         self.num_taps = num_taps
         self.snr_range = snr_range
         self.disable_agc = disable_agc
+        self.samples_per_symbol = samples_per_symbol
 
     def generate_batch(self, batch_size):
-        # Alternative to Rayleigh fading[cite: 54]: Simulate wireline low-pass RC/RLC step responses
-        # Here we use a simplified proxy: exponential decay + random reflections
-        t = torch.linspace(0, 5, self.num_taps)
+        num_samples = self.num_taps * self.samples_per_symbol
+        t = torch.linspace(0, 5, num_samples) / float(self.samples_per_symbol)
 
         channels = []
         for _ in range(batch_size):
@@ -39,7 +40,7 @@ class WirelineChannelGenerator:
             # Add discrete reflections (via/connector proxy)
             num_reflections = torch.randint(1, 4, (1,)).item()
             for _ in range(num_reflections):
-                idx = torch.randint(5, self.num_taps, (1,)).item()
+                idx = torch.randint(5 * self.samples_per_symbol, num_samples, (1,)).item()
                 h[idx] += torch.empty(1).uniform_(-0.2, 0.2).item()
 
             if not self.disable_agc:
@@ -61,10 +62,10 @@ class WirelineChannelGenerator:
         Generates the full received signal by convolving symbols with channel
         and adding AWGN noise. Returns (rx_noisy, h_batch).
         """
-        channel_len = self.num_taps
+        channel_len_samples = self.num_taps * self.samples_per_symbol
 
         # 1. Pad tx_symbols for causal convolution (no look-ahead)
-        tx_padded = F.pad(tx_symbols, (channel_len - 1, 0))
+        tx_padded = F.pad(tx_symbols, (channel_len_samples - 1, 0))
 
         # 2. Reshape for grouped 1D convolution
         tx_reshaped = tx_padded.view(1, batch_size, -1)
@@ -76,7 +77,7 @@ class WirelineChannelGenerator:
             peak_vals, _ = torch.max(torch.abs(h_batch), dim=1, keepdim=True)
             h_batch = h_batch / (peak_vals + 1e-8)
 
-        h_reshaped = h_batch.view(batch_size, 1, channel_len)
+        h_reshaped = h_batch.view(batch_size, 1, channel_len_samples)
 
         # Prompt 1: Fix Time-Reversal
         # F.conv1d computes cross-correlation, not convolution.

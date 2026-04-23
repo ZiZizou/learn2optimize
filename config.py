@@ -17,8 +17,16 @@ torch.manual_seed(SEED)
 # ==========================================
 # Channel Configuration
 # ==========================================
-CH_TAPS = 50           # Number of taps in the wireline channel
+CH_TAPS = 50           # Number of taps in symbol intervals; sample-domain tap count = CH_TAPS * OVERSAMPLE_FACTOR
 SNR_RANGE = (15, 25)   # dB (signal-to-noise ratio range)
+
+# ==========================================
+# Oversampling Configuration
+# ==========================================
+OVERSAMPLE_FACTOR = 1  # Front-end oversampling factor (1 = symbol rate, no oversampling)
+OVERSAMPLE_MODE = "zoh"  # Zero-order hold interpolation only for now
+PHASE_SEARCH_MAX_DELAY = 64  # Max delay for phase search in symbols
+PHASE_SEARCH_SYNC_LEN = 128  # Sync length for phase search
 
 # ==========================================
 # Equalizer Configuration

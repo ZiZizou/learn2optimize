@@ -51,13 +51,14 @@ def add_channel_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def get_channel_generator(args, device=None):
+def get_channel_generator(args, device=None, samples_per_symbol=1):
     """
     Factory function that returns the appropriate channel generator based on args.
 
     Args:
         args: Parsed command-line arguments (must contain channel_type attribute).
         device: Optional torch device to pass to the advanced generator.
+        samples_per_symbol: Number of samples per symbol for channel time grid.
 
     Returns:
         WirelineChannelGenerator, AdvancedWirelineChannelGenerator, or
@@ -70,7 +71,8 @@ def get_channel_generator(args, device=None):
         return S4pChannelGenerator(
             touchstone_file_path=args.touchstone_channel,
             snr_range=SNR_RANGE,
-            disable_agc=disable_agc
+            disable_agc=disable_agc,
+            samples_per_symbol=samples_per_symbol
         )
 
     if args.channel_type == "advanced":
@@ -78,11 +80,13 @@ def get_channel_generator(args, device=None):
             num_taps=CH_TAPS,
             snr_range=SNR_RANGE,
             device=device,
-            disable_agc=disable_agc
+            disable_agc=disable_agc,
+            samples_per_symbol=samples_per_symbol
         )
     else:
         return WirelineChannelGenerator(
             num_taps=CH_TAPS,
             snr_range=SNR_RANGE,
-            disable_agc=disable_agc
+            disable_agc=disable_agc,
+            samples_per_symbol=samples_per_symbol
         )

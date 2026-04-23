@@ -2,8 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Import common configuration
-from config import *
+from config import (
+    CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
+    L2O_STATE_DIM, L2O_HIDDEN_DIM, L2O_DFE_HEAD_SCALE, L2O_CTLE_HEAD_SCALE, L2O_OVERDRIVE_MAX,
+    EMA_BETA, L2O_OVERDRIVE_PENALTY,
+    BATCH_SIZE, EPOCHS,
+    INITIAL_UNROLL, MAX_UNROLL, UNROLL_STEP_EPOCH, UNROLL_DELTA,
+    ABLATE_CTLE, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE,
+    PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
+)
+from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 
 # CONCRETE OUTCOMES OF THIS CODE
 # 1. Baseline Verification
@@ -257,17 +265,32 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         print(f"Epoch {epoch + 1}/{epochs} | Active TBPTT Horizon: {current_unroll_len}")
 
         tx_symbols = torch.sign(torch.randn(batch_size, total_seq_len))
-        rx_base, h_batch = channel_gen.generate_received_signal(tx_symbols, batch_size)
+        tx_frontend = upsample_symbols(tx_symbols, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE)
+        rx_base, h_batch = channel_gen.generate_received_signal(tx_frontend, batch_size)
 
         with torch.no_grad():
             if ablate_ctle:
-                # Use continuous-time serdespy CTLE (Static LTI pre-filtering)
-                rx_init = apply_frequency_domain_ctle(rx_base, peaking_gain=0.5)
+                rx_frontend = apply_frequency_domain_ctle(
+                    rx_base,
+                    peaking_gain=0.5,
+                    samples_per_symbol=OVERSAMPLE_FACTOR,
+                    fc=0.25,
+                )
             else:
-                rx_init = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
-            batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
+                if OVERSAMPLE_FACTOR != 1:
+                    raise ValueError(
+                        "OVERSAMPLE_FACTOR > 1 currently supported only in the "
+                        "frequency-domain CTLE path."
+                    )
+                rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
 
-        common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
+            rx_init, best_phase, common_delay = choose_best_symbol_phase(
+                tx_symbols,
+                rx_frontend,
+                OVERSAMPLE_FACTOR,
+                max_delay=PHASE_SEARCH_MAX_DELAY,
+                sync_len=PHASE_SEARCH_SYNC_LEN,
+            )
 
         hidden_state = torch.zeros(batch_size, L2O_HIDDEN_DIM)
         dfe_weights = torch.zeros(batch_size, dfe.num_taps)
@@ -494,7 +517,7 @@ if __name__ == "__main__":
 
     # Instantiate modules
     print("Initializing modules...")
-    channel_gen = get_channel_generator(args)
+    channel_gen = get_channel_generator(args, samples_per_symbol=OVERSAMPLE_FACTOR)
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
     learned_opt = MultiRateLearnedNLMS(state_dim=L2O_STATE_DIM, hidden_dim=L2O_HIDDEN_DIM, use_two_head=args.two_head)
