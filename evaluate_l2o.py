@@ -6,7 +6,15 @@ import pandas as pd
 import numpy as np
 import argparse
 import ast
-from config import *
+from config import (
+    CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
+    L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM,
+    RLS_LAMBDA, RLS_DELTA,
+    VSS_MU_MAX, VSS_MU_MIN, VSS_ALPHA, VSS_GAMMA, VSS_MOMENTUM,
+    EVAL_BATCH_SIZE, EVAL_SEQ_LENGTH, EVAL_BURN_IN, FIXED_CTLE_PEAKING,
+    OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
+)
+from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 
 # Import architectures from training scripts
 from l2o_basic import MultiRateLearnedNLMS, DifferentiableCTLE, DifferentiableDFE, cross_correlate_sync_batch
@@ -273,37 +281,41 @@ if __name__ == "__main__":
     print("-" * 60)
 
     # Setup environment
-    gen = get_channel_generator(args)
+    gen = get_channel_generator(args, samples_per_symbol=OVERSAMPLE_FACTOR)
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
 
     # Generate batch data once - will be reused for both L2O and baseline evaluation
     tx_symbols = torch.sign(torch.randn(batch_size, seq_len))
-    rx_base, _ = gen.generate_received_signal(tx_symbols, batch_size)
+    tx_frontend = upsample_symbols(tx_symbols, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE)
+    rx_base, _ = gen.generate_received_signal(tx_frontend, batch_size)
 
     if ablate_ctle:
         print("Applying continuous-time SerDesPy CTLE for evaluation...")
-        rx_init = apply_frequency_domain_ctle(rx_base, peaking_gain=ctle_peaking)
+        rx_frontend = apply_frequency_domain_ctle(
+            rx_base,
+            peaking_gain=ctle_peaking,
+            samples_per_symbol=OVERSAMPLE_FACTOR,
+            fc=0.25,
+        )
     else:
-        rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
+        if OVERSAMPLE_FACTOR != 1:
+            raise ValueError(
+                "OVERSAMPLE_FACTOR > 1 currently supported only in the "
+                "frequency-domain CTLE path."
+            )
+        rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-    # Synchronize using cross-correlation to find per-channel delay
-    batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
+    rx_init, best_phase, common_delay = choose_best_symbol_phase(
+        tx_symbols,
+        rx_frontend,
+        OVERSAMPLE_FACTOR,
+        max_delay=PHASE_SEARCH_MAX_DELAY,
+        sync_len=PHASE_SEARCH_SYNC_LEN,
+    )
 
-    # Vectorized per-channel alignment using torch.gather
-    # Each channel is shifted by its exact delay, so rx_aligned[i, 0] corresponds to tx_symbols[i, 0]
-    max_delay = max(batch_delays)
-    aligned_seq_len = rx_init.shape[1] - max_delay
-
-    indices = torch.arange(aligned_seq_len).unsqueeze(0).expand(batch_size, -1)
-    delay_tensor = torch.tensor(batch_delays).unsqueeze(1)
-    gather_indices = indices + delay_tensor
-
-    rx_aligned = torch.gather(rx_init, 1, gather_indices)
-    tx_aligned = tx_symbols[:, :aligned_seq_len]
-
-    print(f"Batch size: {batch_size}, Delay range: [{min(batch_delays)}, {max_delay}], Median: {int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())}")
-    print(f"Aligned sequence length: {tx_aligned.shape[1]}")
+    print(f"Batch size: {batch_size}, Oversample factor: {OVERSAMPLE_FACTOR}")
+    print(f"Best phase: {best_phase}, Median delay: {common_delay}")
     print("-" * 60)
 
     results = {}

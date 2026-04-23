@@ -4,56 +4,17 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# Import common configuration
-from config import *
-
-# ==========================================
-
+from config import (
+    CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
+    RLS_LAMBDA, RLS_DELTA, NLMS_MU_VALUES,
+    FIXED_PEAKING, EVAL_SEQ_LENGTH,
+    OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
+)
+from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 from wireline_channel import WirelineChannelGenerator
+from ctle_frequency_utils import apply_frequency_domain_ctle
 
-# ==========================================
-# 2. Differentiable Parametric CTLE (Identical to l2o_basic.py)
-# ==========================================
-class DifferentiableCTLE(nn.Module):
-    def __init__(self, num_taps=15):
-        super().__init__()
-        self.num_taps = num_taps
-        self.register_buffer('base_lp', self._generate_base_lp())
-        self.register_buffer('base_hp', self._generate_base_hp())
-
-    def _generate_base_lp(self):
-        # Flat response (pass-through / all-pass proxy)
-        lp = torch.zeros(self.num_taps)
-        lp[0] = 1.0
-        return lp
-
-    def _generate_base_hp(self):
-        # High-pass filter: amplifies transitions, subtracts immediate post-cursor
-        hp = torch.zeros(self.num_taps)
-        hp[0] = 1.0
-        hp[1] = -CTLE_HP_ALPHA
-        return hp
-
-    def forward(self, rx_signal, peaking_gain):
-        """
-        rx_signal: [batch, seq_len]
-        peaking_gain: [batch, 1]
-        """
-        # filter_taps shape: [batch, 1, num_taps] for grouped conv1d
-        filter_taps = self.base_lp.unsqueeze(0) + peaking_gain.unsqueeze(-1) * self.base_hp.unsqueeze(0)
-
-        # Apply filter using 1D convolution
-        rx_padded = F.pad(rx_signal, (self.num_taps - 1, 0))
-        batch_size = rx_signal.shape[0]
-        rx_reshaped = rx_padded.view(1, batch_size, -1)
-
-        # Prompt 1: Fix Time-Reversal
-        # F.conv1d computes cross-correlation, not convolution.
-        # Flip the filter taps to physically model causal FIR filtering.
-        filter_taps_flipped = torch.flip(filter_taps, dims=[-1])
-
-        filtered_rx = F.conv1d(rx_reshaped, filter_taps_flipped, groups=batch_size)
-        return filtered_rx.view(batch_size, -1)
+# DifferentiableCTLE not needed for benchmark (uses frequency-domain CTLE only)
 
 # ==========================================
 # 3. NLMS Algorithm with Multi-Tap FFE
@@ -477,29 +438,31 @@ if __name__ == "__main__":
     print("-" * 30)
 
     # 1. Generate test data (batch of channels)
-    gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE)
+    gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE, samples_per_symbol=OVERSAMPLE_FACTOR)
     tx = torch.sign(torch.randn(BENCH_BATCH_SIZE, EVAL_LENGTH))
-    rx_raw, h_true = gen.generate_received_signal(tx, batch_size=BENCH_BATCH_SIZE)
+    tx_frontend = upsample_symbols(tx, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE)
+    rx_raw, h_true = gen.generate_received_signal(tx_frontend, batch_size=BENCH_BATCH_SIZE)
 
-    # 2. Apply Fixed CTLE
-    ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
-    peaking_gain = torch.ones(BENCH_BATCH_SIZE, 1) * FIXED_PEAKING
-    rx_ctle = ctle(rx_raw, peaking_gain)
+    # 2. Apply Fixed CTLE (frequency-domain path only for oversampling)
+    rx_ctle = apply_frequency_domain_ctle(
+        rx_raw,
+        peaking_gain=FIXED_PEAKING,
+        samples_per_symbol=OVERSAMPLE_FACTOR,
+        fc=0.25,
+    )
 
-    # 3. Delay Alignment (Synchronization via Cross-Correlation)
-    # Vectorized per-channel alignment - each channel shifted by its exact delay
-    batch_delays = cross_correlate_sync_batch(tx, rx_ctle)
-    max_delay = max(batch_delays)
-    aligned_seq_len = rx_ctle.shape[1] - max_delay
+    # 3. Phase selection and decimation to symbol rate
+    rx_aligned, best_phase, common_delay = choose_best_symbol_phase(
+        tx,
+        rx_ctle,
+        OVERSAMPLE_FACTOR,
+        max_delay=PHASE_SEARCH_MAX_DELAY,
+        sync_len=PHASE_SEARCH_SYNC_LEN,
+    )
+    tx_aligned = tx
 
-    indices = torch.arange(aligned_seq_len).unsqueeze(0).expand(tx.shape[0], -1)
-    delay_tensor = torch.tensor(batch_delays).unsqueeze(1)
-    gather_indices = indices + delay_tensor
-
-    rx_aligned = torch.gather(rx_ctle, 1, gather_indices)
-    tx_aligned = tx[:, :aligned_seq_len]
-
-    print(f"Synchronized main cursor - Delay range: [{min(batch_delays)}, {max_delay}], Median: {int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())}")
+    print(f"Oversample factor: {OVERSAMPLE_FACTOR}, Best phase: {best_phase}")
+    print(f"Synchronized main cursor - Median delay: {common_delay}")
     print(f"Aligned sequence length: {tx_aligned.shape[1]}")
     print("-" * 30)
 

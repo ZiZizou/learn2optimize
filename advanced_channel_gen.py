@@ -31,7 +31,7 @@ class AdvancedWirelineChannelGenerator:
         device (torch.device): Device to run computations on.
     """
 
-    def __init__(self, num_taps=None, snr_range=None, device=None, disable_agc=False):
+    def __init__(self, num_taps=None, snr_range=None, device=None, disable_agc=False, samples_per_symbol=1):
         """
         Initialize the advanced wireline channel generator.
 
@@ -43,6 +43,7 @@ class AdvancedWirelineChannelGenerator:
             device (torch.device, optional): Device for computations. If None, uses CUDA if available.
             disable_agc (bool, optional): If True, bypasses L2/peak normalization to preserve
                                          true insertion loss physics (raw attenuated voltages).
+            samples_per_symbol (int, optional): Number of samples per symbol for channel time grid.
         """
         self.num_taps = CH_TAPS if num_taps is None else num_taps
         self.snr_range = SNR_RANGE if snr_range is None else snr_range
@@ -50,6 +51,7 @@ class AdvancedWirelineChannelGenerator:
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
         self.disable_agc = disable_agc
+        self.samples_per_symbol = samples_per_symbol
 
     def _sample_channel_parameters(self, batch_size):
         """
@@ -108,13 +110,14 @@ class AdvancedWirelineChannelGenerator:
             params (dict): Dictionary with tau, beta, gamma, omega0 parameters.
 
         Returns:
-            torch.Tensor: Impulse response of shape [batch_size, num_taps].
+            torch.Tensor: Impulse response of shape [batch_size, num_taps * samples_per_symbol].
         """
         batch_size = params['tau'].shape[0]
 
         # Duration Scaling: Scale t_max linearly with tap count. Base equivalent is 5.0 for 50 taps.
+        num_samples = self.num_taps * self.samples_per_symbol
         t_max = 5.0 * (self.num_taps / 50.0)
-        t = torch.linspace(0, t_max, self.num_taps, device=self.device, dtype=torch.float32)
+        t = torch.linspace(0, t_max, num_samples, device=self.device, dtype=torch.float32)
 
         # Expand dimensions for broadcasting: t becomes [1, num_taps]
         t_expanded = t.unsqueeze(0)
