@@ -3,12 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (
-    CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
+    CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, CTLE_HP_ALPHA, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
     L2O_STATE_DIM, L2O_HIDDEN_DIM, L2O_DFE_HEAD_SCALE, L2O_CTLE_HEAD_SCALE, L2O_OVERDRIVE_MAX,
     EMA_BETA, L2O_OVERDRIVE_PENALTY,
     BATCH_SIZE, EPOCHS, UNROLL_LEN,
     ABLATE_CTLE, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE,
-    PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
+    PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN
 )
 from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 
@@ -62,7 +62,7 @@ class DifferentiableCTLE(nn.Module):
         # High-pass filter: amplifies transitions, subtracts immediate post-cursor
         hp = torch.zeros(self.num_taps)
         hp[0] = 1.0
-        hp[1] = -CTLE_HP_ALPHA
+        hp[1] = -1 * CTLE_HP_ALPHA
         return hp
 
     def forward(self, rx_signal, peaking_gain):

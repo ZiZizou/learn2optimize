@@ -306,13 +306,14 @@ if __name__ == "__main__":
             )
         rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-    rx_init, best_phase, common_delay = choose_best_symbol_phase(
+    rx_aligned, best_phase, common_delay = choose_best_symbol_phase(
         tx_symbols,
         rx_frontend,
         OVERSAMPLE_FACTOR,
         max_delay=PHASE_SEARCH_MAX_DELAY,
         sync_len=PHASE_SEARCH_SYNC_LEN,
     )
+    tx_aligned = tx_symbols
 
     print(f"Batch size: {batch_size}, Oversample factor: {OVERSAMPLE_FACTOR}")
     print(f"Best phase: {best_phase}, Median delay: {common_delay}")
