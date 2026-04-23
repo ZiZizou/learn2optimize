@@ -100,16 +100,16 @@ TARGET_MSE_DB = -20     # Target MSE in dB
 L2O_HIDDEN_DIM = 32     # Hidden dimension for GRU/RNN cell
 L2O_STATE_DIM = 6       # State features dimension
 L2O_DFE_HEAD_SCALE = 0.05    # DFE step size bound
-L2O_OVERDRIVE_MAX = 0.4
-L2O_CTLE_HEAD_SCALE = 0.05   # CTLE step size bound
+L2O_OVERDRIVE_MAX = 1.2
+L2O_CTLE_HEAD_SCALE = 0.1   # CTLE step size bound
 L2O_META_LR = 1e-3     # Meta-optimizer learning rate
 CTLE_UPDATE_RATE = 10   # Update CTLE every N symbols
 EMA_BETA = 0.95        # EMA decay for error tracking
 
 # L1 Penalty on step size to force lazy convergence at steady-state
 # Higher values = faster decay to zero step size, but may hurt acquisition
-L2O_MU_PENALTY = 0.05   # L1 penalty weight on mu_dfe
-L2O_OVERDRIVE_PENALTY = 0.01  # L2 penalty weight on mu_overdrive (quadratic)
+L2O_MU_PENALTY = 0.0   # L1 penalty weight on mu_dfe
+L2O_OVERDRIVE_PENALTY = 0.00001  # L2 penalty weight on mu_overdrive (quadratic)
 
 # MLP-specific configuration (for l2o_mlp.py)
 L2O_MLP_HISTORY_LEN = 10   # Number of past states to concatenate for MLP
