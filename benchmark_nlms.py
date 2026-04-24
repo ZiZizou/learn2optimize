@@ -521,7 +521,7 @@ if __name__ == "__main__":
         print("-" * 60)
 
         for mu_val in mu_values:
-            avg_mse_history, final_w = run_batch_nlms_dfe(
+            avg_mse_history, nlms_all_dfe, nlms_all_ffe, mu_nlms = run_batch_nlms_dfe(
                 rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=mu_val, teacher_forcing=False,
                 use_soft_decision=use_soft
             )
