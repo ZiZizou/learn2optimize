@@ -56,6 +56,8 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
     mse_log = []
     mu_log = []  # Track step sizes
+    hard_decision_log = []
+    target_log = []
 
     # Initialize momentum buffers for heavy-ball optimization
     dfe_momentum_buffer = torch.zeros(num_taps, dtype=torch.float32)
@@ -86,6 +88,11 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             e_t = tx_symbols[target_idx] - eq_out
             mse_log.append((e_t.item())**2)
             mu_log.append(current_mu)
+
+            # BER: use hard decision (sign) for detection, compare to tx
+            hard_dec = torch.sign(eq_out) if eq_out != 0 else 1.0
+            hard_decision_log.append(hard_dec.item())
+            target_log.append(tx_symbols[target_idx].item())
 
             # Continuous Variable Step-Size (VSS) Update
             if use_vss:
@@ -126,7 +133,12 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             else:
                 decision_buffer[0] = 0.0
 
-    return torch.tensor(mse_log), weights, w_ffe, torch.tensor(mu_log)
+    # Compute BER (all valid symbols)
+    hard_decisions = torch.tensor(hard_decision_log)
+    targets = torch.tensor(target_log)
+    ber_all = torch.mean((hard_decisions != targets).float()).item()
+
+    return torch.tensor(mse_log), weights, w_ffe, torch.tensor(mu_log), ber_all
 
 
 # ==========================================
@@ -235,6 +247,8 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
 
     mse_log = []
+    hard_decision_log = []
+    target_log = []
 
     for t in range(seq_len):
         # Shift FFE buffer and insert newest sample at index 0
@@ -255,6 +269,11 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
         if target_idx >= 0:
             e_t = tx_symbols[target_idx] - eq_out
             mse_log.append((e_t.item()) ** 2)
+
+            # BER: use hard decision (sign) for detection, compare to tx
+            hard_dec = torch.sign(eq_out) if eq_out != 0 else 1.0
+            hard_decision_log.append(hard_dec.item())
+            target_log.append(tx_symbols[target_idx].item())
 
             # 3. Compute Kalman Gain vector: k_t = P * u_t / (lambda + u_t^T * P * u_t)
             P_u = torch.matmul(P, u_t)  # [system_order, 1]
@@ -289,7 +308,12 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
             else:
                 decision_buffer[0] = 0.0
 
-    return torch.tensor(mse_log), weights
+    # Compute BER (all valid symbols)
+    hard_decisions = torch.tensor(hard_decision_log)
+    targets = torch.tensor(target_log)
+    ber_all = torch.mean((hard_decisions != targets).float()).item()
+
+    return torch.tensor(mse_log), weights, ber_all
 
 # ==========================================
 # 3c. Batch NLMS Wrapper
@@ -319,12 +343,13 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
     mu_histories = []
     all_dfe_weights = []
     all_ffe_weights = []
+    ber_list = []
 
     for i in range(batch_size):
         rx_i = rx_batch[i]  # [seq_len]
         tx_i = tx_batch[i]  # [seq_len]
 
-        mse_history, weights, w_main, mu_history = run_nlms_dfe(
+        mse_history, weights, w_main, mu_history, ber = run_nlms_dfe(
             rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
             use_vss=use_vss, vss_mu_max=vss_mu_max, vss_mu_min=vss_mu_min,
             vss_alpha=vss_alpha, vss_gamma=vss_gamma, vss_momentum=vss_momentum,
@@ -334,6 +359,7 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
         mu_histories.append(mu_history)
         all_dfe_weights.append(weights.cpu().numpy())
         all_ffe_weights.append(w_main.cpu().numpy())
+        ber_list.append(ber)
 
     # Stack and average across batch
     mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
@@ -341,8 +367,9 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
 
     mu_stacked = torch.stack(mu_histories, dim=0)  # [batch_size, seq_len]
     avg_mu_history = torch.mean(mu_stacked, dim=0)   # [seq_len]
+    avg_ber = torch.mean(torch.tensor(ber_list)).item()
 
-    return avg_mse_history, all_dfe_weights, all_ffe_weights, avg_mu_history
+    return avg_mse_history, all_dfe_weights, all_ffe_weights, avg_mu_history, avg_ber
 
 
 # ==========================================
@@ -367,23 +394,26 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
     batch_size = rx_batch.shape[0]
     mse_histories = []
     all_combined_weights = []
+    ber_list = []
 
     for i in range(batch_size):
         rx_i = rx_batch[i]  # [seq_len]
         tx_i = tx_batch[i]  # [seq_len]
 
-        mse_history, weights = run_rls_dfe(
+        mse_history, weights, ber = run_rls_dfe(
             rx_i, tx_i, num_taps=num_taps, lam=lam, delta=delta, teacher_forcing=teacher_forcing,
             use_soft_decision=use_soft_decision, tau=tau
         )
         mse_histories.append(mse_history)
         all_combined_weights.append(weights.cpu().numpy())
+        ber_list.append(ber)
 
     # Stack and average across batch
     mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
     avg_mse_history = torch.mean(mse_stacked, dim=0)  # [seq_len]
+    avg_ber = torch.mean(torch.tensor(ber_list)).item()
 
-    return avg_mse_history, all_combined_weights
+    return avg_mse_history, all_combined_weights, avg_ber
 
 
 # ==========================================
@@ -536,11 +566,11 @@ if __name__ == "__main__":
 
         # Define burn-in period to ignore initial convergence outliers
         print(f"Acquisition vs Steady-State Performance (Batch-Averaged):")
-        print(f"{'Method':<30} | {'MSE @ 500':<12} | {'Steady-State':<15}")
-        print("-" * 60)
+        print(f"{'Method':<35} | {'MSE @ 500':<12} | {'Steady-State':<15} | {'BER':<12}")
+        print("-" * 75)
 
         for mu_val in mu_values:
-            avg_mse_history, nlms_all_dfe, nlms_all_ffe, mu_nlms = run_batch_nlms_dfe(
+            avg_mse_history, nlms_all_dfe, nlms_all_ffe, mu_nlms, ber_nlms = run_batch_nlms_dfe(
                 rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=mu_val, teacher_forcing=False,
                 use_soft_decision=use_soft
             )
@@ -554,15 +584,14 @@ if __name__ == "__main__":
             ss_mse_db = 10 * torch.log10(torch.tensor(ss_mse)).item()
 
             method_name = f"NLMS (mu={mu_val}) [{decision_label}]"
-            print(f"{method_name:<30} | {acq_mse_db:>7.2f} dB | {ss_mse_db:>10.2f} dB")
+            print(f"{method_name:<35} | {acq_mse_db:>7.2f} dB | {ss_mse_db:>10.2f} dB | {ber_nlms:.4e}")
 
             smoothed_mse = pd.Series(avg_mse_history.numpy()).ewm(span=200).mean()
             ax.plot(10 * torch.log10(torch.tensor(smoothed_mse)),
                     label=f'NLMS (mu={mu_val})')
 
         # Run VSS NLMS
-        label_vss = f"NLMS VSS (μ_max={VSS_MU_MAX}) [{decision_label}]"
-        avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss = run_batch_nlms_dfe(
+        avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss, ber_vss = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
             use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
             vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, use_soft_decision=use_soft
@@ -571,7 +600,7 @@ if __name__ == "__main__":
         acq_mse_vss_db = 10 * torch.log10(torch.tensor(acq_mse_vss)).item()
         ss_mse_vss = torch.mean(avg_mse_vss[BURN_IN:]).item()
         ss_mse_vss_db = 10 * torch.log10(torch.tensor(ss_mse_vss)).item()
-        print(f"{'NLMS VSS (μ_max='+str(VSS_MU_MAX)+')':<30} | {acq_mse_vss_db:>7.2f} dB | {ss_mse_vss_db:>10.2f} dB")
+        print(f"{'NLMS VSS (μ_max='+str(VSS_MU_MAX)+')':<35} | {acq_mse_vss_db:>7.2f} dB | {ss_mse_vss_db:>10.2f} dB | {ber_vss:.4e}")
         smoothed_vss = pd.Series(avg_mse_vss.numpy()).ewm(span=200).mean()
         ax.plot(10 * torch.log10(torch.tensor(smoothed_vss)), '--',
                 label=f'VSS NLMS (μ_max={VSS_MU_MAX})', alpha=0.7)
@@ -580,7 +609,7 @@ if __name__ == "__main__":
         signal_variance = torch.var(rx_aligned).item()
         dynamic_delta = RLS_DELTA * signal_variance
         print(f"Signal Variance: {signal_variance:.6f}, Dynamic RLS Delta: {dynamic_delta:.6e}")
-        avg_mse_history_rls, final_w_rls = run_batch_rls_dfe(
+        avg_mse_history_rls, final_w_rls, ber_rls = run_batch_rls_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS,
             lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False,
             use_soft_decision=use_soft
@@ -590,7 +619,7 @@ if __name__ == "__main__":
         acq_mse_rls_db = 10 * torch.log10(torch.tensor(acq_mse_rls)).item()
         ss_mse_rls = torch.mean(avg_mse_history_rls[BURN_IN:]).item()
         ss_mse_rls_db = 10 * torch.log10(torch.tensor(ss_mse_rls)).item()
-        print(f"{'RLS (lam='+str(RLS_LAMBDA)+')':<30} | {acq_mse_rls_db:>7.2f} dB | {ss_mse_rls_db:>10.2f} dB")
+        print(f"{'RLS (lam='+str(RLS_LAMBDA)+')':<35} | {acq_mse_rls_db:>7.2f} dB | {ss_mse_rls_db:>10.2f} dB | {ber_rls:.4e}")
 
         smoothed_mse_rls = pd.Series(avg_mse_history_rls.numpy()).ewm(span=200).mean()
         ax.plot(10 * torch.log10(torch.tensor(smoothed_mse_rls)),
