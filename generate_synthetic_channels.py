@@ -39,65 +39,90 @@ except ImportError:
 # ==========================================
 # Configuration
 # ==========================================
-CH_TAPS = 50  # Number of taps in the wireline channel (from config.py)
+from config import BAUD_RATE_HZ, CH_TAPS, OVERSAMPLE_FACTOR
+
+def interp_complex_to_grid(f_src, h_src, f_tgt):
+    re = np.interp(
+        f_tgt,
+        f_src,
+        h_src.real,
+        left=h_src.real[0],
+        right=0.0,
+    )
+    im = np.interp(
+        f_tgt,
+        f_src,
+        h_src.imag,
+        left=h_src.imag[0],
+        right=0.0,
+    )
+    return re + 1j * im
 
 
 # ==========================================
 # Step 2: S-Parameter Extraction Helper
 # ==========================================
 
-def extract_and_resample_ir(filepath: pathlib.Path, num_taps: int = CH_TAPS) -> np.ndarray:
+def extract_and_resample_ir(
+    filepath: pathlib.Path,
+    span_ui: int = CH_TAPS,
+    samples_per_symbol: int = OVERSAMPLE_FACTOR,
+    baud_rate_hz: float = BAUD_RATE_HZ,
+):
     """
-    Extract impulse response from an S4P file and resample to fixed number of taps.
+    Extract impulse response from an S4P file at a target sample rate.
 
     Args:
         filepath: Path to the .s4p file
-        num_taps: Fixed number of taps to resample to
+        span_ui: Channel impulse response span in unit intervals (UI)
+        samples_per_symbol: Number of samples per symbol (oversampling factor)
+        baud_rate_hz: Baud rate in Hz (defines the frequency grid)
 
     Returns:
-        1D numpy array of shape [num_taps]
+        torch.Tensor of shape [span_ui * samples_per_symbol]
     """
     if not HAS_SKRF:
         raise RuntimeError("scikit-rf is required to parse .s4p files")
 
-    # Read the network
-    network = skrf.Network(str(filepath))
+    net = skrf.Network(str(filepath))
 
-    # Extrapolate to DC if needed to avoid IFFT distortion
-    # VNA measurements often lack a true DC bin, causing non-causal ringing
-    if network.frequency.f[0] != 0:
-        network = network.extrapolate_to_dc()
+    if net.f[0] > 0:
+        try:
+            net = net.extrapolate_to_dc()
+        except Exception:
+            pass
 
-    # Extract S21 (forward transmission from port 1 to port 2)
-    # For differential THRU channels, S21 represents the differential insertion loss
-    if network.number_of_ports == 4:
-        # 4-port file: extract S21
-        s21 = network.s[:, 1, 0]  # row=1, col=0 -> S21
-    elif network.number_of_ports == 2:
-        # 2-port file: extract S21 directly
-        s21 = network.s[:, 1, 0]
-    else:
-        raise ValueError(f"Unsupported number of ports: {network.number_of_ports}")
+    f_meas = net.f
+    h_meas = net.s[:, 1, 0]
 
-    # Get frequency info
-    freq = network.frequency
-    n = len(s21)
+    num_taps = int(span_ui * samples_per_symbol)
+    fs_target = float(baud_rate_hz) * float(samples_per_symbol)
 
-    # Compute impulse response using IFFT
-    # IFFT of S21 gives the time-domain impulse response
-    ir = np.fft.ifftshift(np.fft.ifft(s21, n=n))
+    n_fft = max(1024, 8 * num_taps)
+    f_target = np.fft.rfftfreq(n_fft, d=1.0 / fs_target)
 
-    # Take magnitude (the physical impulse response is the envelope)
-    # For a causal system, we use the real part or magnitude
-    ir = np.abs(ir)
+    if f_target[-1] > f_meas[-1]:
+        print(
+            f"[warn] target Nyquist {f_target[-1]:.3e} Hz exceeds measured "
+            f"bandwidth {f_meas[-1]:.3e} Hz for {filepath}; "
+            f"high-frequency bins will be zero-filled"
+        )
 
-    # Resample/interpolate to fixed num_taps
-    ir_resampled = resample_ir(ir, num_taps)
+    h_target = interp_complex_to_grid(f_meas, h_meas, f_target)
+    ir_full = np.fft.irfft(h_target, n=n_fft)
 
-    # Normalize
-    ir_resampled = ir_resampled / (np.linalg.norm(ir_resampled) + 1e-8)
+    peak = int(np.argmax(np.abs(ir_full)))
+    pre = max(1, samples_per_symbol // 2)
+    start = max(0, peak - pre)
+    stop = start + num_taps
 
-    return ir_resampled
+    ir = ir_full[start:stop]
+    if ir.shape[0] < num_taps:
+        ir = np.pad(ir, (0, num_taps - ir.shape[0]))
+
+    ir = ir.astype(np.float32)
+    ir = ir / (np.linalg.norm(ir) + 1e-12)
+    return torch.from_numpy(ir)
 
 
 def resample_ir(ir: np.ndarray, num_taps: int) -> np.ndarray:
@@ -122,7 +147,9 @@ def resample_ir(ir: np.ndarray, num_taps: int) -> np.ndarray:
 
 def parse_s4p_directory_tree(
     base_dir: pathlib.Path,
-    num_taps: int = CH_TAPS
+    span_ui: int = CH_TAPS,
+    samples_per_symbol: int = OVERSAMPLE_FACTOR,
+    baud_rate_hz: float = BAUD_RATE_HZ,
 ) -> List[Dict[str, Union[torch.Tensor, List[torch.Tensor], None]]]:
     """
     Recursively walk a directory tree and parse S4P files into channel groups.
@@ -134,15 +161,17 @@ def parse_s4p_directory_tree(
 
     Args:
         base_dir: Root directory to walk
-        num_taps: Number of taps to resample IRs to
+        span_ui: Channel IR span in unit intervals
+        samples_per_symbol: Number of samples per symbol (oversampling factor)
+        baud_rate_hz: Baud rate in Hz for frequency grid generation
 
     Returns:
         List of channel group dictionaries:
         [{
-            'thru': torch.Tensor of shape [num_taps],  # Main victim channel
-            'fext': List[torch.Tensor] or None,       # List of FEXT IRs
-            'next': List[torch.Tensor] or None,       # List of NEXT IRs
-            'source_dir': str                           # Source directory name for logging
+            'thru': torch.Tensor of shape [span_ui * sps],  # Main victim channel
+            'fext': List[torch.Tensor] or None,             # List of FEXT IRs
+            'next': List[torch.Tensor] or None,             # List of NEXT IRs
+            'source_dir': str                              # Source directory name for logging
         }, ...]
     """
     if not HAS_SKRF:
@@ -175,8 +204,13 @@ def parse_s4p_directory_tree(
             filepath = pathlib.Path(root) / filename
 
             try:
-                ir = extract_and_resample_ir(filepath, num_taps)
-                ir_tensor = torch.tensor(ir, dtype=torch.float32)
+                ir = extract_and_resample_ir(
+                    filepath,
+                    span_ui=span_ui,
+                    samples_per_symbol=samples_per_symbol,
+                    baud_rate_hz=baud_rate_hz,
+                )
+                ir_tensor = ir
 
                 filename_lower = filename.lower()
 
@@ -223,7 +257,8 @@ def parse_s4p_directory_tree(
 
 def generate_dummy_base_channels(
     num_channels: int = 10,
-    num_taps: int = CH_TAPS
+    span_ui: int = CH_TAPS,
+    samples_per_symbol: int = OVERSAMPLE_FACTOR,
 ) -> List[Dict[str, Union[torch.Tensor, List[torch.Tensor], None]]]:
     """
     Generate synthetic base channels when no .s4p files are available.
@@ -231,22 +266,24 @@ def generate_dummy_base_channels(
 
     Args:
         num_channels: Number of dummy channel groups to generate
-        num_taps: Number of taps per channel
+        span_ui: Channel IR span in unit intervals
+        samples_per_symbol: Number of samples per symbol
 
     Returns:
         List of channel group dictionaries (same structure as parse_s4p_directory_tree)
     """
+    num_taps = span_ui * samples_per_symbol
+    t = np.linspace(0, 5, num_taps) / float(samples_per_symbol)
+
     groups = []
 
     for i in range(num_channels):
-        t = np.linspace(0, 5, num_taps)
         tau = np.random.uniform(0.5, 1.5)
         h = np.exp(-t / tau)
 
-        # Add discrete reflections
         num_reflections = np.random.randint(1, 4)
         for _ in range(num_reflections):
-            idx = np.random.randint(5, num_taps)
+            idx = np.random.randint(5 * samples_per_symbol, num_taps)
             h[idx] += np.random.uniform(-0.2, 0.2)
 
         h = h / (np.linalg.norm(h) + 1e-8)
@@ -635,7 +672,13 @@ def main():
         "--num_taps",
         type=int,
         default=CH_TAPS,
-        help=f"Number of taps per channel (default: {CH_TAPS})"
+        help=f"Channel IR span in unit intervals (default: {CH_TAPS})"
+    )
+    parser.add_argument(
+        "--samples_per_symbol",
+        type=int,
+        default=OVERSAMPLE_FACTOR,
+        help=f"Number of samples per symbol for oversampling (default: {OVERSAMPLE_FACTOR})"
     )
     parser.add_argument(
         "--channel_cascade",
@@ -671,12 +714,17 @@ def main():
 
     args = parser.parse_args()
 
-    # Parse or generate base channel groups
+    span_ui = args.num_taps
+    sps = args.samples_per_symbol
+
+    num_taps = span_ui * sps
+
     if args.dummy_data or args.s4p_dir is None:
         print(f"Generating {args.num_base_channels} dummy base channel groups...")
         parsed_groups = generate_dummy_base_channels(
             num_channels=args.num_base_channels,
-            num_taps=args.num_taps
+            span_ui=span_ui,
+            samples_per_symbol=sps,
         )
         print(f"  Generated {len(parsed_groups)} dummy base channel groups")
     else:
@@ -684,7 +732,12 @@ def main():
         if not s4p_dir.exists():
             raise FileNotFoundError(f"Directory not found: {s4p_dir}")
         print(f"Parsing .s4p files from {s4p_dir} (recursive)...")
-        parsed_groups = parse_s4p_directory_tree(s4p_dir, num_taps=args.num_taps)
+        parsed_groups = parse_s4p_directory_tree(
+            s4p_dir,
+            span_ui=span_ui,
+            samples_per_symbol=sps,
+            baud_rate_hz=BAUD_RATE_HZ,
+        )
         print(f"  Parsed {len(parsed_groups)} channel groups from .s4p files")
 
     # Check if any augmentations are enabled
@@ -699,7 +752,17 @@ def main():
         print(f"  - Mixup: {args.mixup}")
     else:
         print(f"\nNo augmentations enabled. Saving {len(parsed_groups)} base channel groups as-is.")
-        torch.save(parsed_groups, args.out_file)
+        num_taps_out = span_ui * sps
+        payload = {
+            "meta": {
+                "samples_per_symbol": sps,
+                "baud_rate_hz": BAUD_RATE_HZ,
+                "num_taps": num_taps_out,
+                "span_ui": span_ui,
+            },
+            "channels": parsed_groups,
+        }
+        torch.save(payload, args.out_file)
         print(f"Saved to {args.out_file}")
         return
 
@@ -723,10 +786,17 @@ def main():
         base, ext = os.path.splitext(args.out_file)
         args.out_file = f"{base}_synth{ext}"
 
+    # Make filename rate-aware so different oversampling factors don't collide
+    if 'sps' not in args.out_file.lower():
+        base, ext = os.path.splitext(args.out_file)
+        args.out_file = f"{base}_sps{sps}_baud{int(BAUD_RATE_HZ)}{ext}"
+
     # Summary statistics
     print(f"\n--- Summary ---")
     print(f"Base channel groups: {len(parsed_groups)}")
     print(f"Generated {len(synthetic_dataset)} synthetic channel groups")
+    print(f"IR length: {num_taps} taps ({span_ui} UI x {sps} sps)")
+    print(f"Baud rate: {BAUD_RATE_HZ:.3e} Hz, Target FS: {BAUD_RATE_HZ * sps:.3e} Hz")
 
     # Count FEXT/NEXT availability
     fext_count = sum(1 for g in synthetic_dataset if g['fext'] is not None)
@@ -743,8 +813,17 @@ def main():
     print(f"  Min: {thru_stack.min():.6f}")
     print(f"  Max: {thru_stack.max():.6f}")
 
-    # Save output
-    torch.save(synthetic_dataset, args.out_file)
+    # Save output with metadata
+    payload = {
+        "meta": {
+            "samples_per_symbol": sps,
+            "baud_rate_hz": BAUD_RATE_HZ,
+            "num_taps": num_taps,
+            "span_ui": span_ui,
+        },
+        "channels": synthetic_dataset,
+    }
+    torch.save(payload, args.out_file)
     print(f"\nSaved to {args.out_file}")
 
 

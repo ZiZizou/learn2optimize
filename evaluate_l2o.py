@@ -38,13 +38,27 @@ def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_pe
 
     with torch.no_grad():
         if ablate_ctle:
-            # Use continuous-time serdespy CTLE (Static LTI pre-filtering)
-            rx_init = apply_frequency_domain_ctle(rx_base, peaking_gain=ctle_peaking)
+            rx_frontend = apply_frequency_domain_ctle(
+                rx_base,
+                peaking_gain=ctle_peaking,
+                samples_per_symbol=OVERSAMPLE_FACTOR,
+                fc=0.25,
+            )
         else:
-            rx_init = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
-        batch_delays = cross_correlate_sync_batch(tx_symbols, rx_init)
+            if OVERSAMPLE_FACTOR != 1:
+                raise ValueError(
+                    "OVERSAMPLE_FACTOR > 1 currently supported only in the "
+                    "frequency-domain CTLE path."
+                )
+            rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-    common_delay = int(torch.median(torch.tensor(batch_delays, dtype=torch.float)).item())
+        rx_init, best_phase, common_delay = choose_best_symbol_phase(
+            tx_symbols,
+            rx_frontend,
+            OVERSAMPLE_FACTOR,
+            max_delay=PHASE_SEARCH_MAX_DELAY,
+            sync_len=PHASE_SEARCH_SYNC_LEN,
+        )
 
     # Initialize state
     hidden_state = torch.zeros(batch_size, 32) if model_type != "mlp" else None

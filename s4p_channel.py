@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 import random
 
+from config import CH_TAPS
+
 
 class S4pChannelGenerator:
     """
@@ -28,39 +30,36 @@ class S4pChannelGenerator:
     """
 
     def __init__(self, touchstone_file_path, snr_range=(15, 25), disable_agc=False, samples_per_symbol=1):
-        """
-        Initialize the S4P channel generator.
-
-        Args:
-            touchstone_file_path: Path to the .pt file containing the list
-                                  of channel dictionaries.
-            snr_range: Tuple of (min_snr_db, max_snr_db) for AWGN.
-            disable_agc: If True, bypasses peak normalization to preserve
-                        true insertion loss physics.
-            samples_per_symbol: Number of samples per symbol (not yet supported for S4P).
-        """
         self.touchstone_file_path = touchstone_file_path
         self.snr_range = snr_range
         self.disable_agc = disable_agc
         self.samples_per_symbol = samples_per_symbol
 
-        if self.samples_per_symbol != 1:
-            raise NotImplementedError(
-                "S4P oversampling requires regenerating the impulse "
-                "response at the target sample rate."
-            )
+        payload = torch.load(touchstone_file_path, map_location="cpu")
 
-        # Load the pre-processed channel dataset
-        self.dataset = torch.load(touchstone_file_path)
-        if not isinstance(self.dataset, list):
-            raise ValueError(
-                f"Expected dataset to be a list of channel dictionaries, "
-                f"got {type(self.dataset)}"
-            )
+        if isinstance(payload, dict) and "meta" in payload:
+            self.channel_dataset_meta = payload["meta"]
+            self.channel_dataset = payload["channels"]
+
+            dataset_sps = int(self.channel_dataset_meta["samples_per_symbol"])
+            if dataset_sps != int(self.samples_per_symbol):
+                raise ValueError(
+                    "S4P dataset samples_per_symbol mismatch: "
+                    f"dataset={dataset_sps}, "
+                    f"requested={self.samples_per_symbol}"
+                )
+        else:
+            self.channel_dataset_meta = None
+            self.channel_dataset = payload
+            if int(self.samples_per_symbol) != 1:
+                raise ValueError(
+                    "Legacy S4P dataset has no metadata. Regenerate the "
+                    "dataset for oversampling."
+                )
 
         # Validate first entry to ensure expected structure
-        if len(self.dataset) > 0:
-            sample = self.dataset[0]
+        if len(self.channel_dataset) > 0:
+            sample = self.channel_dataset[0]
             required_keys = {'thru', 'fext', 'next'}
             if not required_keys.issubset(sample.keys()):
                 raise ValueError(
@@ -127,17 +126,22 @@ class S4pChannelGenerator:
 
         # Randomly sample channel geometries (with replacement for batch_size > dataset size)
         sampled_indices = [
-            random.randint(0, len(self.dataset) - 1)
+            random.randint(0, len(self.channel_dataset) - 1)
             for _ in range(batch_size_actual)
         ]
-        sampled_dicts = [self.dataset[i] for i in sampled_indices]
+        sampled_dicts = [self.channel_dataset[i] for i in sampled_indices]
 
         # Extract and stack THRU impulse responses
+        expected_len = CH_TAPS * self.samples_per_symbol
         h_thru_list = []
         max_taps = 0
         for d in sampled_dicts:
-            # Ensure thru is 1D
             h_thru_1d = d['thru'].flatten()
+            if h_thru_1d.shape[-1] != expected_len:
+                raise ValueError(
+                    f"S4P thru length mismatch: expected {expected_len}, "
+                    f"got {h_thru_1d.shape[-1]}"
+                )
             h_thru_list.append(h_thru_1d)
             max_taps = max(max_taps, h_thru_1d.shape[-1])
 

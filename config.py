@@ -29,6 +29,15 @@ PHASE_SEARCH_MAX_DELAY = 64  # Max delay for phase search in symbols
 PHASE_SEARCH_SYNC_LEN = 128  # Sync length for phase search
 
 # ==========================================
+# S4P Dataset Configuration
+# ==========================================
+BAUD_RATE_HZ = 32e9  # Baud rate in Hz (used for S-parameter frequency grid generation)
+S4P_DATASET_DIR = "data"  # Directory for S4P dataset files
+S4P_DATASET_TEMPLATE = (
+    "synthetic_s4p_channels_sps{sps}_baud{baud}.pt"
+)  # Filename template: sps=oversample_factor, baud=int(baud_rate_hz)
+
+# ==========================================
 # Equalizer Configuration
 # ==========================================
 DFE_TAPS = 10          # Number of taps in the Decision Feedback Equalizer

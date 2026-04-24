@@ -6,12 +6,21 @@ channel generators via command-line arguments.
 """
 
 import argparse
+import os
 import torch
 
 from wireline_channel import WirelineChannelGenerator
 from advanced_channel_gen import AdvancedWirelineChannelGenerator
 from s4p_channel import S4pChannelGenerator
-from config import CH_TAPS, SNR_RANGE
+from config import BAUD_RATE_HZ, CH_TAPS, OVERSAMPLE_FACTOR, S4P_DATASET_DIR, S4P_DATASET_TEMPLATE, SNR_RANGE
+
+
+def resolve_s4p_dataset_path():
+    filename = S4P_DATASET_TEMPLATE.format(
+        sps=OVERSAMPLE_FACTOR,
+        baud=int(BAUD_RATE_HZ),
+    )
+    return os.path.join(S4P_DATASET_DIR, filename)
 
 
 def add_channel_args(parser: argparse.ArgumentParser):
@@ -68,11 +77,14 @@ def get_channel_generator(args, device=None, samples_per_symbol=1):
 
     # S4P Touchstone channel overrides other channel types
     if getattr(args, 'touchstone_channel', None) is not None:
+        dataset_path = resolve_s4p_dataset_path()
+        if args.touchstone_channel != dataset_path:
+            print(f"[s4p] loading dataset: {dataset_path}")
         return S4pChannelGenerator(
-            touchstone_file_path=args.touchstone_channel,
+            touchstone_file_path=dataset_path,
             snr_range=SNR_RANGE,
             disable_agc=disable_agc,
-            samples_per_symbol=samples_per_symbol
+            samples_per_symbol=samples_per_symbol,
         )
 
     if args.channel_type == "advanced":
