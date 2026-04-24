@@ -7,14 +7,14 @@ import pandas as pd
 from config import (
     CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
     RLS_LAMBDA, RLS_DELTA, NLMS_MU_VALUES,
+    VSS_MU_MAX, VSS_MU_MIN, VSS_ALPHA, VSS_GAMMA, VSS_MOMENTUM,
     FIXED_PEAKING, EVAL_SEQ_LENGTH,
     OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
 )
 from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 from wireline_channel import WirelineChannelGenerator
+from s4p_channel import S4pChannelGenerator
 from ctle_frequency_utils import apply_frequency_domain_ctle
-
-tau = 0.1
 
 # DifferentiableCTLE not needed for benchmark (uses frequency-domain CTLE only)
 
@@ -23,7 +23,7 @@ tau = 0.1
 # ==========================================
 def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forcing=True,
                  use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
-                 vss_momentum=0.0, use_soft_decision=True):
+                 vss_momentum=0.0, use_soft_decision=True, tau=0.1):
     """
     NLMS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -42,6 +42,7 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
         vss_momentum: Momentum coefficient for heavy-ball optimization (default: 0.0, no momentum)
                       Typical values: 0.9 or 0.95 for momentum-enabled updates
         use_soft_decision: If True, use tanh(eq_out/tau) soft decisions; if False, use hard sign decisions
+        tau: Soft decision temperature parameter (default: 0.1)
     """
     seq_len = rx_signal.shape[0]
     weights = torch.zeros(num_taps, dtype=torch.float32)
@@ -202,7 +203,7 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
 # ==========================================
 # 3b. RLS Algorithm with Multi-Tap FFE
 # ==========================================
-def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_forcing=True, use_soft_decision=True):
+def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_forcing=True, use_soft_decision=True, tau=0.1):
     """
     RLS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -216,6 +217,7 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
 
     Parameters:
         use_soft_decision: If True, use tanh(eq_out/tau) soft decisions; if False, use hard sign decisions
+        tau: Soft decision temperature parameter (default: 0.1)
     """
     seq_len = rx_signal.shape[0]
     system_order = FFE_TAPS + num_taps  # FFE_TAPS forward + num_taps feedback
@@ -293,7 +295,7 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
 # ==========================================
 def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_forcing=False,
                        use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
-                       vss_momentum=0.0, use_soft_decision=True):
+                       vss_momentum=0.0, use_soft_decision=True, tau=0.1):
     """
     Wrapper to run NLMS DFE over a batch of channels.
 
@@ -309,6 +311,7 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
 
     Parameters:
         use_soft_decision: If True, use tanh soft decisions; if False, use hard sign decisions
+        tau: Soft decision temperature parameter (default: 0.1)
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
@@ -324,7 +327,7 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
             rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
             use_vss=use_vss, vss_mu_max=vss_mu_max, vss_mu_min=vss_mu_min,
             vss_alpha=vss_alpha, vss_gamma=vss_gamma, vss_momentum=vss_momentum,
-            use_soft_decision=use_soft_decision
+            use_soft_decision=use_soft_decision, tau=tau
         )
         mse_histories.append(mse_history)
         mu_histories.append(mu_history)
@@ -344,7 +347,7 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
 # ==========================================
 # 3d. Batch RLS Wrapper
 # ==========================================
-def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teacher_forcing=False, use_soft_decision=True):
+def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teacher_forcing=False, use_soft_decision=True, tau=0.1):
     """
     Wrapper to run RLS DFE over a batch of channels.
 
@@ -358,6 +361,7 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
 
     Parameters:
         use_soft_decision: If True, use tanh soft decisions; if False, use hard sign decisions
+        tau: Soft decision temperature parameter (default: 0.1)
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
@@ -369,7 +373,7 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
 
         mse_history, weights = run_rls_dfe(
             rx_i, tx_i, num_taps=num_taps, lam=lam, delta=delta, teacher_forcing=teacher_forcing,
-            use_soft_decision=use_soft_decision
+            use_soft_decision=use_soft_decision, tau=tau
         )
         mse_histories.append(mse_history)
         all_combined_weights.append(weights.cpu().numpy())
@@ -437,6 +441,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NLMS/RLS Baseline Benchmark")
     parser.add_argument("--decision_type", type=str, default="soft", choices=["soft", "hard", "both"],
                         help="Decision type: 'soft' (tanh), 'hard' (sign), or 'both' (plot side-by-side)")
+    parser.add_argument("--synthetic_channel", type=str, default=None,
+                        help="Path to .pt file with synthetic channel data (e.g. synthetic_channels.pt). "
+                             "If not provided, generates random channels using WirelineChannelGenerator.")
     args = parser.parse_args()
 
     use_soft_list = []
@@ -464,11 +471,22 @@ if __name__ == "__main__":
     print(f"Decision Type: {args.decision_type}")
     print("-" * 30)
 
-    # 1. Generate test data (batch of channels)
-    gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE, samples_per_symbol=OVERSAMPLE_FACTOR)
+    # 1. Generate or load test data (batch of channels)
     tx = torch.sign(torch.randn(BENCH_BATCH_SIZE, EVAL_LENGTH))
     tx_frontend = upsample_symbols(tx, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE)
-    rx_raw, h_true = gen.generate_received_signal(tx_frontend, batch_size=BENCH_BATCH_SIZE)
+
+    if args.synthetic_channel is not None:
+        print(f"Loading synthetic channels from: {args.synthetic_channel}")
+        gen = S4pChannelGenerator(
+            touchstone_file_path=args.synthetic_channel,
+            snr_range=SNR_RANGE,
+            disable_agc=False,
+            samples_per_symbol=OVERSAMPLE_FACTOR,
+        )
+        rx_raw, h_true = gen.generate_received_signal(tx_frontend, batch_size=BENCH_BATCH_SIZE)
+    else:
+        gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE, samples_per_symbol=OVERSAMPLE_FACTOR)
+        rx_raw, h_true = gen.generate_received_signal(tx_frontend, batch_size=BENCH_BATCH_SIZE)
 
     # 2. Apply Fixed CTLE (frequency-domain path only for oversampling)
     rx_ctle = apply_frequency_domain_ctle(
