@@ -6,10 +6,10 @@ time-domain Impulse Responses (IRs), and applies physics-based data augmentation
 to synthetically expand the dataset for Learned Optimizer (L2O) training.
 
 Augmentations:
-- Cascade: Simulates plugging two cables together (Convolution)
-- Insertion Loss (IL) Tilting: Simulates variations in dielectric loss/cable length (RC filtering)
-- Random Reflections: Simulates via/connector impedance mismatches (Time-domain spike injection)
-- Mixup: Mathematical regularization (Linear interpolation between two channels)
+- Cascade: Simulates plugging two cables together (frequency-domain transfer multiplication)
+- Insertion Loss: Simulates variations in dielectric loss/cable length (frequency-domain model)
+- Random Reflections: Simulates via/connector impedance mismatches (delayed echo superposition)
+- Mixup: Mathematical regularization, NOT physics (Linear interpolation between two channels)
 
 Physics Note:
 The THRU (main victim channel), FEXT (Far-End Crosstalk), and NEXT (Near-End Crosstalk)
@@ -17,13 +17,21 @@ are kept separate. Augmentations are applied ONLY to the THRU channel because:
 - Aggressor transmitters send independent, asynchronous random bit sequences
 - Superposition applies to voltages at the receiver, not to impulse responses
 - FEXT/NEXT act as bounded colored noise signatures specific to the physical layout
+
+Scientific Notes on S-Parameter Handling:
+- A 4-port .s4p file stores a 4x4 scattering matrix S(f) vs frequency in single-ended basis
+- For a differential pair represented in single-ended ports, the physically relevant transfer
+  is often Sdd21 (differential-to-differential), not raw S21
+- Sdd21 = 0.5 * (S21 - S23 - S41 + S43) for port pairing (1,3) input and (2,4) output
+- Mixup is a regularization technique, not a physical model - it should not be marketed
+  as physics-based augmentation
 """
 
 import argparse
 import os
 import pathlib
 import random
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Union, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +43,15 @@ except ImportError:
     HAS_SKRF = False
     print("Warning: scikit-rf not installed. Use --dummy_data flag for synthetic generation.")
 
+from s4p_inspector import (
+    inspect_touchstone_file,
+    extract_transfer_function,
+    sdd21_from_se_s4p,
+    PortMode,
+    TransferMode,
+    print_inspection_report,
+)
+
 
 # ==========================================
 # Configuration
@@ -42,6 +59,20 @@ except ImportError:
 from config import BAUD_RATE_HZ, CH_TAPS, OVERSAMPLE_FACTOR
 
 def interp_complex_to_grid(f_src, h_src, f_tgt):
+    """
+    Interpolate complex transfer function to target frequency grid.
+
+    Simple linear interpolation of real and imaginary parts.
+    For dispersive channels, consider phase-aware interpolation.
+
+    Args:
+        f_src: Source frequency grid (Hz)
+        h_src: Complex transfer function on source grid
+        f_tgt: Target frequency grid (Hz)
+
+    Returns:
+        Complex transfer function interpolated to target grid
+    """
     re = np.interp(
         f_tgt,
         f_src,
@@ -59,30 +90,116 @@ def interp_complex_to_grid(f_src, h_src, f_tgt):
     return re + 1j * im
 
 
-# ==========================================
-# Step 2: S-Parameter Extraction Helper
-# ==========================================
+def resample_transfer_to_ir(
+    freq_hz: np.ndarray,
+    H: np.ndarray,
+    fs_target: float,
+    num_taps: int,
+    span_ui: int,
+    samples_per_symbol: int,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Resample a transfer function to target grid and compute impulse response.
+
+    Uses measured frequency spacing to determine FFT size and applies
+    simple linear interpolation. Bandwidth adequacy is checked.
+
+    Args:
+        freq_hz: Measured frequency grid (Hz)
+        H: Complex transfer function on measured grid
+        fs_target: Target sample rate (Hz)
+        num_taps: Number of output taps (span_ui * samples_per_symbol)
+        span_ui: Channel IR span in unit intervals
+        samples_per_symbol: Oversampling factor
+
+    Returns:
+        Tuple of (ir_cropped, metadata) where:
+            - ir_cropped: Cropped impulse response of length num_taps
+            - metadata: Dict with alignment and quality info
+    """
+    n_fft = max(1024, 8 * num_taps)
+    f_target = np.fft.rfftfreq(n_fft, d=1.0 / fs_target)
+
+    if f_target[-1] > freq_hz[-1]:
+        print(
+            f"  [warn] target Nyquist {f_target[-1]:.3e} Hz exceeds measured "
+            f"bandwidth {freq_hz[-1]:.3e} Hz; "
+            f"high-frequency bins will be zero-filled"
+        )
+
+    H_tgt = interp_complex_to_grid(freq_hz, H, f_target)
+    ir_full = np.fft.irfft(H_tgt, n=n_fft)
+
+    peak = int(np.argmax(np.abs(ir_full)))
+    pre = max(1, samples_per_symbol // 2)
+    start = max(0, peak - pre)
+    stop = start + num_taps
+
+    ir_cropped = ir_full[start:stop]
+    if ir_cropped.shape[0] < num_taps:
+        ir_cropped = np.pad(ir_cropped, (0, num_taps - ir_cropped.shape[0]))
+
+    metadata = {
+        "peak_index": peak,
+        "crop_start": start,
+        "crop_stop": stop,
+        "n_fft": n_fft,
+        "bandwidth_ratio": freq_hz[-1] / (fs_target / 2) if fs_target > 0 else 0.0,
+    }
+
+    return ir_cropped, metadata
+
 
 def extract_and_resample_ir(
     filepath: pathlib.Path,
     span_ui: int = CH_TAPS,
     samples_per_symbol: int = OVERSAMPLE_FACTOR,
     baud_rate_hz: float = BAUD_RATE_HZ,
+    port_pairing: str = "auto",
+    transfer_mode: str = "auto",
+    normalization: str = "l2",
 ):
     """
-    Extract impulse response from an S4P file at a target sample rate.
+    Extract impulse response from a Touchstone file at a target sample rate.
+
+    Uses the s4p_inspector module to properly handle:
+    - 4-port single-ended files representing differential pairs
+    - Mixed-mode vs single-ended mode detection
+    - Correct transfer function selection (S21 vs Sdd21)
 
     Args:
         filepath: Path to the .s4p file
         span_ui: Channel impulse response span in unit intervals (UI)
         samples_per_symbol: Number of samples per symbol (oversampling factor)
         baud_rate_hz: Baud rate in Hz (defines the frequency grid)
+        port_pairing: Port pairing for 4-port files - "auto", "13-24", "12-34", or "14-23"
+        transfer_mode: Transfer extraction mode - "auto", "s21", or "sdd21"
+        normalization: Normalization mode - "none", "peak", or "l2"
 
     Returns:
         torch.Tensor of shape [span_ui * samples_per_symbol]
     """
     if not HAS_SKRF:
         raise RuntimeError("scikit-rf is required to parse .s4p files")
+
+    # Inspect the file
+    report = inspect_touchstone_file(filepath, baud_rate_hz)
+
+    # Resolve pairing
+    if port_pairing == "auto":
+        resolved_pairing = report.port_pairing
+    else:
+        resolved_pairing = port_pairing
+
+    # Resolve transfer mode
+    if transfer_mode == "auto":
+        resolved_mode = report.transfer_mode
+    elif transfer_mode == "s21":
+        resolved_mode = TransferMode.S21
+    elif transfer_mode == "sdd21":
+        resolved_mode = TransferMode.SDD21
+    else:
+        resolved_mode = TransferMode.S21
 
     net = skrf.Network(str(filepath))
 
@@ -92,36 +209,35 @@ def extract_and_resample_ir(
         except Exception:
             pass
 
-    f_meas = net.f
-    h_meas = net.s[:, 1, 0]
+    # Extract the appropriate transfer function
+    f_meas, H, transfer_name = extract_transfer_function(
+        net,
+        role="thru",
+        transfer_mode=resolved_mode,
+        port_pairing=resolved_pairing,
+        inspection_report=report,
+    )
 
     num_taps = int(span_ui * samples_per_symbol)
     fs_target = float(baud_rate_hz) * float(samples_per_symbol)
 
-    n_fft = max(1024, 8 * num_taps)
-    f_target = np.fft.rfftfreq(n_fft, d=1.0 / fs_target)
-
-    if f_target[-1] > f_meas[-1]:
-        print(
-            f"[warn] target Nyquist {f_target[-1]:.3e} Hz exceeds measured "
-            f"bandwidth {f_meas[-1]:.3e} Hz for {filepath}; "
-            f"high-frequency bins will be zero-filled"
-        )
-
-    h_target = interp_complex_to_grid(f_meas, h_meas, f_target)
-    ir_full = np.fft.irfft(h_target, n=n_fft)
-
-    peak = int(np.argmax(np.abs(ir_full)))
-    pre = max(1, samples_per_symbol // 2)
-    start = max(0, peak - pre)
-    stop = start + num_taps
-
-    ir = ir_full[start:stop]
-    if ir.shape[0] < num_taps:
-        ir = np.pad(ir, (0, num_taps - ir.shape[0]))
+    # Resample to target grid and get IR
+    ir, ir_meta = resample_transfer_to_ir(
+        f_meas, H, fs_target, num_taps, span_ui, samples_per_symbol
+    )
 
     ir = ir.astype(np.float32)
-    ir = ir / (np.linalg.norm(ir) + 1e-12)
+
+    # Apply normalization if requested
+    if normalization == "none":
+        pass  # preserve raw amplitude
+    elif normalization == "peak":
+        peak = np.max(np.abs(ir))
+        if peak > 0:
+            ir = ir / peak
+    elif normalization == "l2":
+        ir = ir / (np.linalg.norm(ir) + 1e-12)
+
     return torch.from_numpy(ir)
 
 
@@ -150,6 +266,9 @@ def parse_s4p_directory_tree(
     span_ui: int = CH_TAPS,
     samples_per_symbol: int = OVERSAMPLE_FACTOR,
     baud_rate_hz: float = BAUD_RATE_HZ,
+    port_pairing: str = "auto",
+    transfer_mode: str = "auto",
+    normalization: str = "l2",
 ) -> List[Dict[str, Union[torch.Tensor, List[torch.Tensor], None]]]:
     """
     Recursively walk a directory tree and parse S4P files into channel groups.
@@ -164,6 +283,9 @@ def parse_s4p_directory_tree(
         span_ui: Channel IR span in unit intervals
         samples_per_symbol: Number of samples per symbol (oversampling factor)
         baud_rate_hz: Baud rate in Hz for frequency grid generation
+        port_pairing: Port pairing for 4-port files - "auto", "13-24", "12-34", "14-23"
+        transfer_mode: Transfer extraction mode - "auto", "s21", or "sdd21"
+        normalization: Normalization mode - "none", "peak", or "l2"
 
     Returns:
         List of channel group dictionaries:
@@ -209,6 +331,9 @@ def parse_s4p_directory_tree(
                     span_ui=span_ui,
                     samples_per_symbol=samples_per_symbol,
                     baud_rate_hz=baud_rate_hz,
+                    port_pairing=port_pairing,
+                    transfer_mode=transfer_mode,
+                    normalization=normalization,
                 )
                 ir_tensor = ir
 
@@ -683,17 +808,18 @@ def main():
     parser.add_argument(
         "--channel_cascade",
         action="store_true",
-        help="Apply cascade augmentation (convolution with random channels)"
+        help="Apply cascade augmentation (frequency-domain transfer multiplication). "
+             "Note: This is an approximation assuming matched interfaces."
     )
     parser.add_argument(
         "--insertion_loss_tilting",
         action="store_true",
-        help="Apply insertion loss tilting (RC low-pass filtering)"
+        help="Apply insertion loss augmentation (frequency-domain skin-effect and dielectric loss model)."
     )
     parser.add_argument(
         "--random_reflection",
         action="store_true",
-        help="Apply random reflection augmentation (impedance mismatch spikes)"
+        help="Apply reflection augmentation (frequency-domain delayed-echo superposition)."
     )
     parser.add_argument(
         "--mixup",
@@ -710,6 +836,38 @@ def main():
         type=int,
         default=10,
         help="Number of base channel groups to generate when using dummy data (default: 10)"
+    )
+    parser.add_argument(
+        "--port_pairing",
+        type=str,
+        default="auto",
+        choices=["auto", "13-24", "12-34", "14-23"],
+        help="Port pairing for 4-port files: 'auto' to infer, or explicit pairing "
+             "(13-24, 12-34, 14-23). For differential pairs in single-ended format, "
+             "'13-24' is often correct (ports 1,3 input; ports 2,4 output)."
+    )
+    parser.add_argument(
+        "--transfer_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "s21", "sdd21"],
+        help="Transfer extraction mode: 'auto' to use inspector inference, 's21' for "
+             "raw single-ended S21, 'sdd21' for mixed-mode differential transfer. "
+             "For differential pairs, 'sdd21' is usually physically more relevant than 's21'."
+    )
+    parser.add_argument(
+        "--normalization",
+        type=str,
+        default="l2",
+        choices=["none", "peak", "l2"],
+        help="Normalization mode for extracted channels: 'none' preserves raw amplitude "
+             "(recommended for physics-based generation), 'peak' normalizes to peak=1, "
+             "'l2' normalizes L2 norm to 1."
+    )
+    parser.add_argument(
+        "--inspect_only",
+        action="store_true",
+        help="Only inspect Touchstone files and print reports without generating channels."
     )
 
     args = parser.parse_args()
@@ -737,6 +895,9 @@ def main():
             span_ui=span_ui,
             samples_per_symbol=sps,
             baud_rate_hz=BAUD_RATE_HZ,
+            port_pairing=args.port_pairing,
+            transfer_mode=args.transfer_mode,
+            normalization=args.normalization,
         )
         print(f"  Parsed {len(parsed_groups)} channel groups from .s4p files")
 

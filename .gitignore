@@ -47,3 +47,5 @@ temp_process
 scratchpad.md
 processed_802_3ck/*
 PROBLEM_STATEMENT.md
+docs/*
+tests/*
