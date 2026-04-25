@@ -76,6 +76,8 @@ def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_pe
 
     mse_history = []
     mu_history = []  # Track step sizes for analysis
+    hard_decision_log = []
+    target_log = []
 
     with torch.no_grad():
         effective_len = seq_len - common_delay
@@ -119,6 +121,11 @@ def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_pe
 
                 target_symbol = tx_symbols[:, target_idx:target_idx + 1]
                 e_t = target_symbol - y_out
+
+                # BER: hard decision per batch sample
+                hard_dec = torch.where(y_out != 0, torch.sign(y_out), torch.ones_like(y_out))
+                hard_decision_log.append(hard_dec.cpu())
+                target_log.append(target_symbol.cpu())
 
                 norm_sq = torch.sum(ffe_buffer ** 2, dim=1, keepdim=True) + \
                           torch.sum(decision_buffer ** 2, dim=1, keepdim=True) + 1e-6
@@ -189,7 +196,12 @@ def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_pe
                 decision_buffer = torch.roll(decision_buffer, shifts=1, dims=1)
                 decision_buffer[:, 0] = 0
 
-    return torch.tensor(mse_history), w_ffe, dfe_weights, torch.tensor(mu_history)
+    # Compute BER across all valid symbols
+    hard_decisions = torch.cat(hard_decision_log, dim=1)  # [batch_size, num_valid]
+    targets = torch.cat(target_log, dim=1)                 # [batch_size, num_valid]
+    ber = torch.mean((hard_decisions != targets).float()).item()
+
+    return torch.tensor(mse_history), w_ffe, dfe_weights, torch.tensor(mu_history), ber
 
 if __name__ == "__main__":
     # Parse command-line arguments (fall back to config defaults)
@@ -403,13 +415,13 @@ if __name__ == "__main__":
             try:
                 model.load_state_dict(torch.load(path))
                 print(f"Loaded {name} from {path}")
-                mse_trace, w_ffe_final, dfe_final, mu_trace = run_l2o_inference(model, mtype, rx_base, tx_symbols, ctle, dfe, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
+                mse_trace, w_ffe_final, dfe_final, mu_trace, ber = run_l2o_inference(model, mtype, rx_base, tx_symbols, ctle, dfe, ctle_peaking=ctle_peaking, ablate_ctle=ablate_ctle)
                 max_acq_mu = torch.max(mu_trace[:50]).item()
                 print(f"Max Step Size during Acquisition: {max_acq_mu:.4f}")
                 avg_mse = torch.mean(mse_trace).item()
                 ss_mse = torch.mean(mse_trace[burn_in:]).item()
                 ss_mu = torch.mean(mu_trace[burn_in:]).item() if len(mu_trace) > burn_in else torch.mean(mu_trace).item()
-                results[name] = (avg_mse, ss_mse)
+                results[name] = (avg_mse, ss_mse, ber)
                 step_size_history[name] = mu_trace
                 # Store all channel weights (not averaged)
                 all_ffe_weights[name] = [w_ffe_final[i].cpu().numpy() for i in range(batch_size)]
@@ -424,10 +436,10 @@ if __name__ == "__main__":
 
     # Static NLMS Bench (if enabled)
     if include_nlms:
-        avg_mse_nlms, nlms_all_dfe, nlms_all_ffe, mu_nlms = run_batch_nlms_dfe(
+        avg_mse_nlms, nlms_all_dfe, nlms_all_ffe, mu_nlms, ber_nlms = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False
         )
-        results["NLMS (0.05)"] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item())
+        results["NLMS (0.05)"] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item(), ber_nlms)
         all_ffe_weights["NLMS (0.05)"] = nlms_all_ffe
         all_dfe_weights["NLMS (0.05)"] = nlms_all_dfe
         step_size_history["NLMS (0.05)"] = mu_nlms  # Static mu=0.05
@@ -446,12 +458,12 @@ if __name__ == "__main__":
             label_vss_mom = f"NLMS VSS (μ_max={vss_mu_max_val}, Mom={VSS_MOMENTUM})"
 
             # VSS NLMS (no momentum)
-            avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss = run_batch_nlms_dfe(
+            avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss, ber_vss = run_batch_nlms_dfe(
                 rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
                 use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
                 vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA
             )
-            results[label_vss] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item())
+            results[label_vss] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item(), ber_vss)
             all_ffe_weights[label_vss] = vss_all_ffe
             all_dfe_weights[label_vss] = vss_all_dfe
             step_size_history[label_vss] = mu_vss
@@ -460,12 +472,12 @@ if __name__ == "__main__":
 
             # VSS NLMS with Momentum (if momentum is enabled and not suppressed)
             if VSS_MOMENTUM != 0.0 and not args.no_vss_nlms_mom:
-                avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe, mu_vss_mom = run_batch_nlms_dfe(
+                avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe, mu_vss_mom, ber_vss_mom = run_batch_nlms_dfe(
                     rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
                     use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
                     vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM
                 )
-                results[label_vss_mom] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item())
+                results[label_vss_mom] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item(), ber_vss_mom)
                 all_ffe_weights[label_vss_mom] = vss_mom_all_ffe
                 all_dfe_weights[label_vss_mom] = vss_mom_all_dfe
                 step_size_history[label_vss_mom] = mu_vss_mom
@@ -478,10 +490,10 @@ if __name__ == "__main__":
         signal_variance = torch.var(rx_aligned).item()
         dynamic_delta = RLS_DELTA * signal_variance
         print(f"Signal Variance: {signal_variance:.6f}, Dynamic RLS Delta: {dynamic_delta:.6e}")
-        avg_mse_rls, rls_all_combined = run_batch_rls_dfe(
+        avg_mse_rls, rls_all_combined, ber_rls = run_batch_rls_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False
         )
-        results["RLS"] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item())
+        results["RLS"] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item(), ber_rls)
         # RLS combines FFE and DFE into one weight vector [FFE_TAPS + DFE_TAPS]
         all_ffe_weights["RLS"] = [w[:FFE_TAPS] for w in rls_all_combined]
         all_dfe_weights["RLS"] = [w[FFE_TAPS:] for w in rls_all_combined]
@@ -490,10 +502,10 @@ if __name__ == "__main__":
 
     # Final Reporting
     print("\nComparison Table (Evaluation on {} symbols, batch-avg):".format(seq_len))
-    print(f"{'Method':<35} | {'Avg MSE (dB)':<15} | {'SS MSE (dB)':<15}")
-    print("-" * 70)
-    for name, (avg, ss) in results.items():
-        print(f"{name:<35} | {10*np.log10(avg):>12.2f} dB | {10*np.log10(ss):>12.2f} dB")
+    print(f"{'Method':<35} | {'Avg MSE (dB)':<15} | {'SS MSE (dB)':<15} | {'BER':<12}")
+    print("-" * 75)
+    for name, (avg, ss, ber) in results.items():
+        print(f"{name:<35} | {10*np.log10(avg):>12.2f} dB | {10*np.log10(ss):>12.2f} dB | {ber:.4e}")
 
     # Step Size Summary
     print("\n" + "="*75)
