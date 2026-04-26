@@ -58,12 +58,22 @@ from s4p_inspector import (
 # ==========================================
 from config import BAUD_RATE_HZ, CH_TAPS, OVERSAMPLE_FACTOR
 
-def interp_complex_to_grid(f_src, h_src, f_tgt):
-    """
-    Interpolate complex transfer function to target frequency grid.
+def next_power_of_two(n: int) -> int:
+    """Return the smallest power of two >= n."""
+    return 1 << (n - 1).bit_length()
 
-    Simple linear interpolation of real and imaginary parts.
-    For dispersive channels, consider phase-aware interpolation.
+
+def interp_complex_to_grid_phase_aware(
+    f_src: np.ndarray,
+    h_src: np.ndarray,
+    f_tgt: np.ndarray,
+) -> np.ndarray:
+    """
+    Phase-aware interpolation of complex transfer function.
+
+    Uses log-magnitude and unwrapped phase interpolation, which is superior
+    to real/imag linear interpolation for dispersive channels where phase
+    varies smoothly but real/imag components can change rapidly.
 
     Args:
         f_src: Source frequency grid (Hz)
@@ -73,21 +83,15 @@ def interp_complex_to_grid(f_src, h_src, f_tgt):
     Returns:
         Complex transfer function interpolated to target grid
     """
-    re = np.interp(
-        f_tgt,
-        f_src,
-        h_src.real,
-        left=h_src.real[0],
-        right=0.0,
-    )
-    im = np.interp(
-        f_tgt,
-        f_src,
-        h_src.imag,
-        left=h_src.imag[0],
-        right=0.0,
-    )
-    return re + 1j * im
+    eps = 1e-12
+    mag = np.maximum(np.abs(h_src), eps)
+    log_mag = np.log(mag)
+    phase = np.unwrap(np.angle(h_src))
+
+    log_mag_tgt = np.interp(f_tgt, f_src, log_mag, left=log_mag[0], right=log_mag[-1])
+    phase_tgt = np.interp(f_tgt, f_src, phase, left=phase[0], right=phase[-1])
+
+    return np.exp(log_mag_tgt + 1j * phase_tgt)
 
 
 def resample_transfer_to_ir(
@@ -101,8 +105,8 @@ def resample_transfer_to_ir(
     """
     Resample a transfer function to target grid and compute impulse response.
 
-    Uses measured frequency spacing to determine FFT size and applies
-    simple linear interpolation. Bandwidth adequacy is checked.
+    Uses measured frequency spacing to determine FFT size and phase-aware
+    interpolation. Bandwidth adequacy is checked and group delay is estimated.
 
     Args:
         freq_hz: Measured frequency grid (Hz)
@@ -115,24 +119,41 @@ def resample_transfer_to_ir(
     Returns:
         Tuple of (ir_cropped, metadata) where:
             - ir_cropped: Cropped impulse response of length num_taps
-            - metadata: Dict with alignment and quality info
+            - metadata: Dict with alignment and quality info including
+                        group_delay_samples, precursor_ratio, bandwidth_ratio
     """
-    n_fft = max(1024, 8 * num_taps)
+    df_meas = np.median(np.diff(freq_hz))
+    n_fft_min = int(np.ceil(fs_target / df_meas))
+    safety_factor = 1.5
+    n_fft = next_power_of_two(max(n_fft_min, int(safety_factor * num_taps), 1024))
+
     f_target = np.fft.rfftfreq(n_fft, d=1.0 / fs_target)
 
-    if f_target[-1] > freq_hz[-1]:
+    target_nyquist = fs_target / 2
+    measured_fmax = freq_hz[-1]
+    bandwidth_ratio = measured_fmax / target_nyquist if target_nyquist > 0 else 0.0
+
+    if bandwidth_ratio < 1.0:
         print(
-            f"  [warn] target Nyquist {f_target[-1]:.3e} Hz exceeds measured "
-            f"bandwidth {freq_hz[-1]:.3e} Hz; "
+            f"  [warn] target Nyquist {target_nyquist:.3e} Hz exceeds measured "
+            f"bandwidth {measured_fmax:.3e} Hz (ratio={bandwidth_ratio:.2f}); "
             f"high-frequency bins will be zero-filled"
         )
 
-    H_tgt = interp_complex_to_grid(freq_hz, H, f_target)
+    H_tgt = interp_complex_to_grid_phase_aware(freq_hz, H, f_target)
     ir_full = np.fft.irfft(H_tgt, n=n_fft)
 
-    peak = int(np.argmax(np.abs(ir_full)))
-    pre = max(1, samples_per_symbol // 2)
-    start = max(0, peak - pre)
+    peak_idx = int(np.argmax(np.abs(ir_full)))
+
+    group_delay_samples = estimate_group_delay(f_target, H_tgt)
+    aligned_idx = peak_idx - int(round(group_delay_samples))
+    aligned_idx = max(0, min(aligned_idx, len(ir_full) - num_taps))
+
+    pre_cursor_energy = np.sum(ir_full[:peak_idx]**2)
+    total_energy = np.sum(ir_full**2) + 1e-12
+    precursor_ratio = pre_cursor_energy / total_energy
+
+    start = aligned_idx
     stop = start + num_taps
 
     ir_cropped = ir_full[start:stop]
@@ -140,14 +161,59 @@ def resample_transfer_to_ir(
         ir_cropped = np.pad(ir_cropped, (0, num_taps - ir_cropped.shape[0]))
 
     metadata = {
-        "peak_index": peak,
+        "peak_index": peak_idx,
         "crop_start": start,
         "crop_stop": stop,
         "n_fft": n_fft,
-        "bandwidth_ratio": freq_hz[-1] / (fs_target / 2) if fs_target > 0 else 0.0,
+        "bandwidth_ratio": bandwidth_ratio,
+        "group_delay_samples": group_delay_samples,
+        "precursor_ratio": precursor_ratio,
     }
 
     return ir_cropped, metadata
+
+
+def estimate_group_delay(f: np.ndarray, H: np.ndarray) -> float:
+    """
+    Estimate bulk group delay from phase slope in the passband.
+
+    Fits phase(f) ≈ -2π f τ + c over low-loss band (where |H| is near maximum).
+    Returns delay in samples at the given frequency grid.
+
+    Args:
+        f: Frequency grid (Hz)
+        H: Complex transfer function on that grid
+
+    Returns:
+        Group delay in samples (can be negative if peak is early)
+    """
+    mag = np.abs(H)
+    max_mag = np.max(mag)
+
+    low_loss_mask = mag > 0.5 * max_mag
+    if np.sum(low_loss_mask) < 5:
+        return 0.0
+
+    f_low = f[low_loss_mask]
+    phase = np.unwrap(np.angle(H[low_loss_mask]))
+
+    f_mean = np.mean(f_low)
+    numer = np.sum((f_low - f_mean) * (phase + 2 * np.pi * f_low))
+    denom = np.sum((f_low - f_mean) ** 2)
+
+    if denom < 1e-10:
+        return 0.0
+
+    tau_hz = -numer / denom / (2 * np.pi)
+
+    if len(f) > 1:
+        df = (f[-1] - f[0]) / (len(f) - 1)
+        fs = 1.0 / df if df > 0 else 1.0
+        tau_samples = tau_hz * fs
+    else:
+        tau_samples = 0.0
+
+    return tau_samples
 
 
 def extract_and_resample_ir(
@@ -376,6 +442,51 @@ def parse_s4p_directory_tree(
     return parsed_groups
 
 
+def inspect_s4p_directory(
+    base_dir: pathlib.Path,
+    baud_rate_hz: float = BAUD_RATE_HZ,
+    port_pairing: str = "auto",
+    transfer_mode: str = "auto",
+) -> None:
+    """
+    Inspect all .s4p files in a directory tree and print human-readable reports.
+
+    Args:
+        base_dir: Root directory to walk
+        baud_rate_hz: Baud rate in Hz for Nyquist frequency calculation
+        port_pairing: Port pairing for 4-port files - "auto", "13-24", "12-34", or "14-23"
+        transfer_mode: Transfer extraction mode - "auto", "s21", or "sdd21"
+    """
+    if not HAS_SKRF:
+        raise RuntimeError("scikit-rf is required to parse .s4p files. Install with: pip install scikit-rf")
+
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Directory not found: {base_dir}")
+
+    print(f"Inspecting .s4p files from {base_dir} (recursive)...")
+    print()
+
+    inspected_count = 0
+    for root, dirs, files in os.walk(base_dir):
+        s4p_files = [f for f in files if f.lower().endswith('.s4p')]
+
+        if not s4p_files:
+            continue
+
+        for filename in s4p_files:
+            filepath = pathlib.Path(root) / filename
+            try:
+                report = inspect_touchstone_file(filepath, baud_rate_hz)
+                print_inspection_report(report)
+                print()
+                inspected_count += 1
+            except Exception as e:
+                print(f"Warning: Failed to inspect {filepath}: {e}")
+                continue
+
+    print(f"Inspected {inspected_count} file(s)")
+
+
 # ==========================================
 # Dummy Data Generation
 # ==========================================
@@ -442,6 +553,320 @@ def generate_dummy_base_channels(
 # Step 3: Augmentation Functions (apply to THRU only)
 # ==========================================
 
+def build_frequency_grid(
+    num_taps: int,
+    fs_hz: float,
+) -> np.ndarray:
+    """Build frequency grid for real FFT of length num_taps."""
+    n_fft = num_taps * 2 - 1
+    return np.fft.rfftfreq(n_fft, d=1.0 / fs_hz)
+
+
+def augment_il_freq(
+    H_batch: np.ndarray,
+    f_grid: np.ndarray,
+    alpha_c_range: tuple = (0.0, 0.5),
+    alpha_d_range: tuple = (0.0, 0.1),
+    delta_l_range: tuple = (0.0, 1.0),
+    delay_per_length: float = 1e-9,
+) -> np.ndarray:
+    """
+    Insertion Loss Augmentation: Simulates extra propagation loss in frequency domain.
+
+    Uses an effective model:
+        H_aug(f) = H(f) * exp(-(α_c·√f + α_d·f)·Δℓ) * exp(-j·2π·f·τ'·Δℓ)
+
+    Where:
+    - α_c: conductor/skin-effect loss coefficient (∝ √f)
+    - α_d: dielectric loss coefficient (∝ f)
+    - Δℓ: effective additional length (normalised)
+    - τ': delay per unit length
+
+    This is NOT a full RLGC telegrapher equation model - it is an effective
+    extra-propagation-loss model that captures frequency-dependent loss behavior
+    better than simple RC filtering.
+
+    Args:
+        H_batch: Batch of complex transfer functions [batch, n_freq]
+        f_grid: Frequency grid in Hz [n_freq]
+        alpha_c_range: Range for conductor loss coefficient α_c
+        alpha_d_range: Range for dielectric loss coefficient α_d
+        delta_l_range: Range for effective length multiplier Δℓ
+        delay_per_length: Base delay per unit length in seconds (default 1ns)
+
+    Returns:
+        Augmented transfer functions [batch, n_freq]
+    """
+    batch_size = H_batch.shape[0]
+
+    alpha_c = np.random.uniform(alpha_c_range[0], alpha_c_range[1], batch_size)
+    alpha_d = np.random.uniform(alpha_d_range[0], alpha_d_range[1], batch_size)
+    delta_l = np.random.uniform(delta_l_range[0], delta_l_range[1], batch_size)
+
+    f_ghz = f_grid / 1e9
+
+    loss_factor = np.exp(-(
+        alpha_c[:, None] * np.sqrt(f_ghz) +
+        alpha_d[:, None] * f_ghz
+    ) * delta_l[:, None])
+
+    phase_factor = np.exp(-1j * 2 * np.pi * f_grid * delay_per_length * delta_l[:, None])
+
+    A_loss = loss_factor * phase_factor
+
+    return H_batch * A_loss
+
+
+def augment_reflections_freq(
+    H_batch: np.ndarray,
+    f_grid: np.ndarray,
+    num_refs_range: tuple = (1, 4),
+    delay_ui_min: float = 0.5,
+    delay_ui_max: float = 10.0,
+    amp_max: float = 0.15,
+    ui_period_s: float = 1e-9,
+) -> np.ndarray:
+    """
+    Reflection Augmentation: Simulates impedance mismatches via delayed echoes in frequency domain.
+
+    Uses:
+        R(f) = 1 + Σ a_k · exp(-j·2π·f·τ_k)
+        H_aug(f) = H(f) · R(f)
+
+    Where:
+    - τ_k are physical delays in UI (not sample index)
+    - a_k are bounded echo amplitudes (|a_k| ≤ amp_max)
+    - The exponential phase factor respects oversampling naturally
+
+    This is superior to integer-index spike injection because it works correctly
+    in frequency domain and respects physical delay units.
+
+    Args:
+        H_batch: Batch of complex transfer functions [batch, n_freq]
+        f_grid: Frequency grid in Hz [n_freq]
+        num_refs_range: Range for number of reflections to add
+        delay_ui_min: Minimum delay in UI
+        delay_ui_max: Maximum delay in UI
+        amp_max: Maximum reflection amplitude (as fraction of peak)
+        ui_period_s: Unit interval period in seconds
+
+    Returns:
+        Augmented transfer functions [batch, n_freq]
+    """
+    batch_size = H_batch.shape[0]
+    n_freq = H_batch.shape[1]
+
+    num_refs = np.random.randint(num_refs_range[0], num_refs_range[1] + 1, batch_size)
+
+    delays_ui = np.random.uniform(delay_ui_min, delay_ui_max, (batch_size, num_refs_range[1]))
+    amps = np.random.uniform(-amp_max, amp_max, (batch_size, num_refs_range[1]))
+
+    mask = np.arange(num_refs_range[1]) < num_refs[:, None]
+    delays_ui = delays_ui * mask
+    amps = amps * mask
+
+    delays_s = delays_ui * ui_period_s
+
+    phase_terms = np.exp(-1j * 2 * np.pi * f_grid[np.newaxis, :] * delays_s[:, :, np.newaxis])
+    R = 1.0 + np.sum(amps[:, :, np.newaxis] * phase_terms, axis=1)
+
+    return H_batch * R
+
+
+def augment_cascade_freq(
+    H_batch: np.ndarray,
+    f_grid: np.ndarray,
+    thru_pool: np.ndarray,
+    pool_f_grid: np.ndarray,
+) -> np.ndarray:
+    """
+    Cascade Augmentation: Simulates plugging two cables together via frequency-domain transfer multiplication.
+
+    H_total(f) = H_1(f) · H_2(f)
+
+    This is an approximation assuming:
+    - Matched interfaces between segments
+    - Negligible mismatch interaction
+
+    A full multi-reflection network cascade would require proper de-embedding of
+    reference impedance transitions. Scalar multiplication ignores these effects.
+
+    Args:
+        H_batch: Batch of complex transfer functions [batch, n_freq]
+        f_grid: Frequency grid for H_batch [n_freq]
+        thru_pool: Pool of THRU transfer functions for sampling [N, n_freq_pool]
+        pool_f_grid: Frequency grid for pool [n_freq_pool]
+
+    Returns:
+        Augmented transfer functions [batch, n_freq]
+    """
+    batch_size = H_batch.shape[0]
+
+    indices = np.random.randint(0, len(thru_pool), batch_size)
+    H_cascade = thru_pool[indices]
+
+    H_cascade_interp = interpolate_transfer(H_cascade, pool_f_grid, f_grid)
+
+    H_product = H_batch * H_cascade_interp
+
+    return H_product
+
+
+def interpolate_transfer(
+    H_src: np.ndarray,
+    f_src: np.ndarray,
+    f_tgt: np.ndarray,
+) -> np.ndarray:
+    """
+    Interpolate transfer functions to target frequency grid using phase-aware method.
+
+    Args:
+        H_src: Source transfer functions [batch, n_src]
+        f_src: Source frequency grid [n_src]
+        f_tgt: Target frequency grid [n_tgt]
+
+    Returns:
+        Interpolated transfer functions [batch, n_tgt]
+    """
+    eps = 1e-12
+    batch_size = H_src.shape[0]
+    n_tgt = len(f_tgt)
+
+    mag = np.maximum(np.abs(H_src), eps)
+    log_mag = np.log(mag)
+    phase = np.unwrap(np.angle(H_src), axis=1)
+
+    log_mag_tgt = np.zeros((batch_size, n_tgt))
+    phase_tgt = np.zeros((batch_size, n_tgt))
+
+    for i in range(batch_size):
+        log_mag_tgt[i] = np.interp(f_tgt, f_src, log_mag[i])
+        phase_tgt[i] = np.interp(f_tgt, f_src, phase[i])
+
+    H_tgt = np.exp(log_mag_tgt + 1j * phase_tgt)
+
+    return H_tgt
+
+
+def transfer_to_ir_batch(
+    H_batch: np.ndarray,
+    f_grid: np.ndarray,
+    fs_hz: float,
+    num_taps: int,
+) -> np.ndarray:
+    """
+    Convert batch of transfer functions to impulse responses.
+
+    Args:
+        H_batch: Batch of complex transfer functions [batch, n_freq]
+        f_grid: Frequency grid [n_freq]
+        fs_hz: Target sample rate in Hz
+        num_taps: Number of output taps
+
+    Returns:
+        Batch of impulse responses [batch, num_taps]
+    """
+    n_fft = num_taps * 2 - 1
+
+    ir_full = np.fft.irfft(H_batch, n=n_fft, axis=1)
+
+    ir_cropped = ir_full[:, :num_taps]
+    if ir_cropped.shape[1] < num_taps:
+        pad_width = [(0, 0), (0, num_taps - ir_cropped.shape[1])]
+        ir_cropped = np.pad(ir_cropped, pad_width)
+
+    return ir_cropped
+
+
+def ir_to_transfer_batch(
+    h_batch: np.ndarray,
+    fs_hz: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert batch of impulse responses to frequency domain.
+
+    Args:
+        h_batch: Batch of impulse responses [batch, num_taps]
+        fs_hz: Sample rate in Hz
+
+    Returns:
+        Tuple of (H_batch, f_grid) where:
+            - H_batch: Complex transfer functions [batch, n_freq]
+            - f_grid: Frequency grid [n_freq]
+    """
+    n_fft = h_batch.shape[1] * 2 - 1
+
+    H_batch = np.fft.rfft(h_batch, n=n_fft, axis=1)
+
+    f_grid = np.fft.rfftfreq(n_fft, d=1.0 / fs_hz)
+
+    return H_batch, f_grid
+
+
+def normalize_l2(x: np.ndarray) -> np.ndarray:
+    """L2 normalize along the last axis."""
+    norm = np.linalg.norm(x, axis=-1, keepdims=True)
+    return x / (norm + 1e-12)
+
+
+def apply_augmentations_to_ir(
+    h_batch: torch.Tensor,
+    fs_hz: float,
+    augmentations: Dict[str, bool],
+    cascade_params: Dict,
+    il_params: Dict,
+    reflection_params: Dict,
+    pool: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Apply frequency-domain augmentations to a batch of impulse responses.
+
+    Augmentations are applied in the frequency domain where physically meaningful,
+    then converted back to time domain.
+
+    Args:
+        h_batch: Batch of IRs [batch, num_taps]
+        fs_hz: Sample rate in Hz
+        augmentations: Dict of augmentation flags
+        cascade_params: Params for cascade augmentation
+        il_params: Params for insertion loss augmentation
+        reflection_params: Params for reflection augmentation
+        pool: Optional pool of THRU IRs for cascade/mixup [N, num_taps]
+
+    Returns:
+        Augmented batch [batch, num_taps]
+    """
+    h_np = h_batch.cpu().numpy()
+
+    H_batch, f_grid = ir_to_transfer_batch(h_np, fs_hz)
+
+    if augmentations.get('cascade', False) and pool is not None:
+        pool_np = pool.cpu().numpy()
+        pool_H, pool_f = ir_to_transfer_batch(pool_np, fs_hz)
+        H_batch = augment_cascade_freq(H_batch, f_grid, pool_H, pool_f)
+
+    if augmentations.get('il_tilt', False):
+        H_batch = augment_il_freq(
+            H_batch, f_grid,
+            alpha_c_range=il_params.get('alpha_c_range', (0.0, 0.5)),
+            alpha_d_range=il_params.get('alpha_d_range', (0.0, 0.1)),
+            delta_l_range=il_params.get('delta_l_range', (0.0, 1.0)),
+        )
+
+    if augmentations.get('reflections', False):
+        H_batch = augment_reflections_freq(
+            H_batch, f_grid,
+            num_refs_range=reflection_params.get('num_refs_range', (1, 4)),
+            delay_ui_min=reflection_params.get('delay_ui_min', 0.5),
+            delay_ui_max=reflection_params.get('delay_ui_max', 10.0),
+            amp_max=reflection_params.get('amp_max', 0.15),
+        )
+
+    h_aug_np = transfer_to_ir_batch(H_batch, f_grid, fs_hz, h_np.shape[1])
+
+    return torch.from_numpy(h_aug_np).to(h_batch.device)
+
+
 def augment_cascade(
     h_batch: torch.Tensor,
     thru_pool: torch.Tensor
@@ -449,8 +874,10 @@ def augment_cascade(
     """
     Channel Cascade (Convolution): Simulates plugging two cables together.
 
-    Randomly selects channels from the thru_pool to convolve with h_batch using
-    frequency-domain convolution for efficiency.
+    DEPRECATED: Use augment_cascade_freq via apply_augmentations_to_ir for
+    frequency-domain cascade before cropping.
+
+    This version works on already-cropped IRs and does NOT preserve physical scaling.
 
     Args:
         h_batch: Batch of THRU channels [batch_size, num_taps]
@@ -461,24 +888,18 @@ def augment_cascade(
     """
     batch_size, num_taps = h_batch.shape
 
-    # Sample random channels from thru_pool for each batch element
     indices = torch.randint(0, len(thru_pool), (batch_size,))
-    h_cascade = thru_pool[indices]  # [batch_size, num_taps]
+    h_cascade = thru_pool[indices]
 
-    # Use FFT-based convolution for efficiency
     conv_length = num_taps * 2 - 1
 
-    # Convert to frequency domain
     h_batch_fft = torch.fft.rfft(h_batch, n=conv_length)
     h_cascade_fft = torch.fft.rfft(h_cascade, n=conv_length)
 
-    # Multiply in frequency domain (convolution theorem)
     product_fft = h_batch_fft * h_cascade_fft
 
-    # Back to time domain
     result = torch.fft.irfft(product_fft, n=conv_length)
 
-    # Truncate back to num_taps and normalize
     result = result[:, :num_taps]
 
     return result / (torch.norm(result, dim=1, keepdim=True) + 1e-8)
@@ -490,6 +911,9 @@ def augment_il_tilt(
 ) -> torch.Tensor:
     """
     Insertion Loss Tilting (RC Filtering): Simulates extra high-frequency loss.
+
+    DEPRECATED: Use augment_il_freq via apply_augmentations_to_ir for
+    frequency-domain skin-effect and dielectric model.
 
     Uses a randomized 1st-order low-pass filter:
     h_new[n] = (1 - alpha)*h[n] + alpha*h[n-1]
@@ -503,14 +927,11 @@ def augment_il_tilt(
     """
     batch_size = h_batch.shape[0]
 
-    # Random alpha per channel: 0 = no loss, 0.4 = heavy loss
     alpha = torch.empty(batch_size, 1).uniform_(alpha_range[0], alpha_range[1])
 
-    # Shift right by 1 (causal filter: output depends on current and previous input)
     h_shifted = torch.roll(h_batch, shifts=1, dims=1)
-    h_shifted[:, 0] = 0.0  # Zero initial condition
+    h_shifted[:, 0] = 0.0
 
-    # Apply first-order low-pass filter
     h_aug = (1.0 - alpha) * h_batch + alpha * h_shifted
 
     return h_aug / (torch.norm(h_aug, dim=1, keepdim=True) + 1e-8)
@@ -525,10 +946,11 @@ def augment_reflections(
     """
     Random Reflection (Impedance Mismatch): Injects discrete spikes into post-cursor tail.
 
+    DEPRECATED: Use augment_reflections_freq via apply_augmentations_to_ir for
+    frequency-domain delayed-echo model with physical delay units.
+
     Vectorized implementation using scatter_add_ for GPU-efficient batch processing.
-    Physics-based correction: Reflection amplitude is scaled by the main cursor
-    (peak amplitude) of each channel, ensuring the reflection coefficient Gamma
-    remains bounded.
+    Reflection amplitude is scaled by peak amplitude to bound reflection coefficient.
 
     Args:
         h_batch: Batch of channels [batch_size, num_taps]
@@ -543,22 +965,16 @@ def augment_reflections(
     batch_size, num_taps = h_aug.shape
     device = h_aug.device
 
-    # 1. Find peak amplitudes for the entire batch: shape [batch_size, 1]
     peak_amps = torch.max(torch.abs(h_aug), dim=1, keepdim=True)[0]
 
-    # 2. Generate random number of reflections per channel: shape [batch_size, 1]
     num_refs = torch.randint(1, max_refs + 1, (batch_size, 1), device=device)
 
-    # 3. Create indices and amplitude ratios: shape [batch_size, max_refs]
     indices = torch.randint(min_idx, num_taps, (batch_size, max_refs), device=device)
     amp_ratios = torch.empty((batch_size, max_refs), device=device).uniform_(-max_ratio, max_ratio)
 
-    # 4. Create a mask to zero out padding reflections (variable count per channel)
-    # arange shape [max_refs], broadcast against num_refs
     mask = torch.arange(max_refs, device=device).expand(batch_size, max_refs) < num_refs
     amp_ratios = amp_ratios * mask
 
-    # 5. Scale by peak amplitudes and add to channel using scatter_add_
     scaled_amps = amp_ratios * peak_amps
     h_aug.scatter_add_(1, indices, scaled_amps)
 
@@ -656,6 +1072,8 @@ def generate_synthetic_channels(
     insertion_loss_tilting: bool = False,
     random_reflection: bool = False,
     mixup: bool = False,
+    use_freq_domain_aug: bool = True,
+    fs_hz: float = BAUD_RATE_HZ * OVERSAMPLE_FACTOR,
 ) -> List[Dict]:
     """
     Generate synthetic channels by applying augmentations to THRU channels only.
@@ -678,84 +1096,104 @@ def generate_synthetic_channels(
         insertion_loss_tilting: Whether to apply IL tilt augmentation
         random_reflection: Whether to apply reflection augmentation
         mixup: Whether to apply mixup augmentation
+        use_freq_domain_aug: Use frequency-domain augmentations (preserves physical scaling)
+        fs_hz: Sample rate for frequency-domain operations
 
     Returns:
-        List of synthetic channel group dicts:
+        List of synthetic channel group dicts with metadata:
         [{
             'thru': torch.Tensor [num_taps],
             'fext': torch.Tensor or None,
             'next': torch.Tensor or None,
+            'physics_valid': True,  # False if mixup was applied
+            'augmentation_class': 'physical' or 'regularization',
         }, ...]
     """
-    # Build a pool of just THRU channels for cascade/mixup operations
     thru_pool = torch.stack([g['thru'] for g in parsed_groups])
+    pool_fs = float(fs_hz)
 
     synthetic_dataset = []
     num_complete_batches = num_generated // batch_size
     remainder = num_generated % batch_size
 
+    augmentations = {
+        'cascade': channel_cascade,
+        'il_tilt': insertion_loss_tilting,
+        'reflections': random_reflection,
+    }
+    cascade_params = {}
+    il_params = {
+        'alpha_c_range': (0.0, 0.5),
+        'alpha_d_range': (0.0, 0.1),
+        'delta_l_range': (0.0, 1.0),
+    }
+    reflection_params = {
+        'num_refs_range': (1, 4),
+        'delay_ui_min': 0.5,
+        'delay_ui_max': 10.0,
+        'amp_max': 0.15,
+    }
+
     for batch_idx in range(num_complete_batches):
-        # Sample random groups
         h_current, associated_groups = sample_random_groups(parsed_groups, batch_size)
 
-        # Apply augmentations in order (only to THRU)
-        if mixup:
-            h_current = augment_mixup(h_current, thru_pool)
-        if channel_cascade:
-            h_current = augment_cascade(h_current, thru_pool)
-        if insertion_loss_tilting:
-            h_current = augment_il_tilt(h_current)
-        if random_reflection:
-            h_current = augment_reflections(h_current)
+        if use_freq_domain_aug and any(augmentations.values()):
+            h_current = apply_augmentations_to_ir(
+                h_current, pool_fs, augmentations, cascade_params,
+                il_params, reflection_params, thru_pool
+            )
+        else:
+            if mixup:
+                h_current = augment_mixup(h_current, thru_pool)
+            if channel_cascade:
+                h_current = augment_cascade(h_current, thru_pool)
+            if insertion_loss_tilting:
+                h_current = augment_il_tilt(h_current)
+            if random_reflection:
+                h_current = augment_reflections(h_current)
 
-        # Build output groups
         for i in range(batch_size):
+            physics_valid = not mixup
+            aug_class = "regularization" if mixup else "physical"
+
             group = {
-                'thru': h_current[i],  # [num_taps]
+                'thru': h_current[i],
+                'fext': random.choice(associated_groups[i]['fext']) if associated_groups[i]['fext'] else None,
+                'next': random.choice(associated_groups[i]['next']) if associated_groups[i]['next'] else None,
+                'physics_valid': physics_valid,
+                'augmentation_class': aug_class,
             }
-
-            # Randomly sample one FEXT if available
-            if associated_groups[i]['fext']:
-                group['fext'] = random.choice(associated_groups[i]['fext'])
-            else:
-                group['fext'] = None
-
-            # Randomly sample one NEXT if available
-            if associated_groups[i]['next']:
-                group['next'] = random.choice(associated_groups[i]['next'])
-            else:
-                group['next'] = None
-
             synthetic_dataset.append(group)
 
-    # Handle remainder
     if remainder > 0:
         h_current, associated_groups = sample_random_groups(parsed_groups, remainder)
 
-        if mixup:
-            h_current = augment_mixup(h_current, thru_pool)
-        if channel_cascade:
-            h_current = augment_cascade(h_current, thru_pool)
-        if insertion_loss_tilting:
-            h_current = augment_il_tilt(h_current)
-        if random_reflection:
-            h_current = augment_reflections(h_current)
+        if use_freq_domain_aug and any(augmentations.values()):
+            h_current = apply_augmentations_to_ir(
+                h_current, pool_fs, augmentations, cascade_params,
+                il_params, reflection_params, thru_pool
+            )
+        else:
+            if mixup:
+                h_current = augment_mixup(h_current, thru_pool)
+            if channel_cascade:
+                h_current = augment_cascade(h_current, thru_pool)
+            if insertion_loss_tilting:
+                h_current = augment_il_tilt(h_current)
+            if random_reflection:
+                h_current = augment_reflections(h_current)
 
         for i in range(remainder):
+            physics_valid = not mixup
+            aug_class = "regularization" if mixup else "physical"
+
             group = {
                 'thru': h_current[i],
+                'fext': random.choice(associated_groups[i]['fext']) if associated_groups[i]['fext'] else None,
+                'next': random.choice(associated_groups[i]['next']) if associated_groups[i]['next'] else None,
+                'physics_valid': physics_valid,
+                'augmentation_class': aug_class,
             }
-
-            if associated_groups[i]['fext']:
-                group['fext'] = random.choice(associated_groups[i]['fext'])
-            else:
-                group['fext'] = None
-
-            if associated_groups[i]['next']:
-                group['next'] = random.choice(associated_groups[i]['next'])
-            else:
-                group['next'] = None
-
             synthetic_dataset.append(group)
 
     return synthetic_dataset
@@ -858,7 +1296,7 @@ def main():
     parser.add_argument(
         "--normalization",
         type=str,
-        default="l2",
+        default="none",
         choices=["none", "peak", "l2"],
         help="Normalization mode for extracted channels: 'none' preserves raw amplitude "
              "(recommended for physics-based generation), 'peak' normalizes to peak=1, "
@@ -876,6 +1314,17 @@ def main():
     sps = args.samples_per_symbol
 
     num_taps = span_ui * sps
+
+    if args.inspect_only:
+        if args.s4p_dir is None:
+            raise ValueError("--inspect_only requires --s4p_dir to be specified")
+        inspect_s4p_directory(
+            pathlib.Path(args.s4p_dir),
+            baud_rate_hz=BAUD_RATE_HZ,
+            port_pairing=args.port_pairing,
+            transfer_mode=args.transfer_mode,
+        )
+        return
 
     if args.dummy_data or args.s4p_dir is None:
         print(f"Generating {args.num_base_channels} dummy base channel groups...")
@@ -936,11 +1385,9 @@ def main():
         insertion_loss_tilting=args.insertion_loss_tilting,
         random_reflection=args.random_reflection,
         mixup=args.mixup,
+        use_freq_domain_aug=True,
+        fs_hz=BAUD_RATE_HZ * sps,
     )
-
-    # Mark each group as synthetic
-    for group in synthetic_dataset:
-        group['synth'] = True
 
     # Auto-add 'synth' to output filename if not present
     if 'synth' not in args.out_file.lower():
@@ -975,12 +1422,26 @@ def main():
     print(f"  Max: {thru_stack.max():.6f}")
 
     # Save output with metadata
+    augmentation_summary = []
+    if args.channel_cascade:
+        augmentation_summary.append("cascade")
+    if args.insertion_loss_tilting:
+        augmentation_summary.append("il_tilt")
+    if args.random_reflection:
+        augmentation_summary.append("reflections")
+    if args.mixup:
+        augmentation_summary.append("mixup")
+
     payload = {
         "meta": {
             "samples_per_symbol": sps,
             "baud_rate_hz": BAUD_RATE_HZ,
             "num_taps": num_taps,
             "span_ui": span_ui,
+            "normalization": args.normalization,
+            "port_pairing": args.port_pairing,
+            "transfer_mode": args.transfer_mode,
+            "augmentations": augmentation_summary if augmentation_summary else "none",
         },
         "channels": synthetic_dataset,
     }
