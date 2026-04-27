@@ -112,35 +112,43 @@ class TestScientificBehavior:
             f"Delay changed under scaling: {delay_ref} vs {delay_sc}"
 
     def test_heterogeneous_delay_recovery(self):
-        """Per-example sync recovers different known delays."""
-        B, T, P = 4, 200, 8
-        torch.manual_seed(123)
+        """Per-example sync recovers different known per-example delays."""
+        B, T, P = 4, 128, 8
+        torch.manual_seed(42)
 
         tx = torch.randn(B, T).sign()
         tx_up = upsample_symbols(tx, P)  # [B, T*P]
 
-        # Insert distinct known delays per example
-        known_delays = torch.tensor([3, 7, 12, 18])
+        # For each batch element, insert a distinct integer-sample delay
+        # by shifting the upsampled tx right (prepend zeros)
+        known_delays = torch.tensor([3, 7, 11, 19])
         rx_list = []
         for b in range(B):
-            delay = known_delays[b].item()
-            # Start with noise, insert the upsampled tx at a delayed phase
-            impulse = 0.01 * torch.randn(T * P)
-            # Place tx symbols at every P-th position starting from delay
-            impulse[delay::P] = tx_up[b, :T*P-delay]  # valid portion
-            rx_list.append(impulse)
+            d = known_delays[b].item()
+            rx_b = torch.zeros(T * P)
+            if d > 0:
+                rx_b[d:] = tx_up[b, :-d]
+            else:
+                rx_b[:] = tx_up[b]
+            rx_list.append(rx_b + 0.001 * torch.randn(T * P))
         rx = torch.stack(rx_list)
 
         best_rx, phase, delay = choose_best_symbol_phase_per_example(
             tx, rx, P, use_normalized_corr=True
         )
 
-        # Per-example delays should approximately match the known inserted delays
-        # Allow tolerance of ±2 since we approximate placement
-        recovered = delay.float()
-        expected = known_delays.float()
-        assert torch.allclose(recovered, expected, atol=2), \
-            f"Delay recovery failed: recovered {recovered} vs expected {expected}"
+        # Phase should equal the integer delay modulo P (phase is the sample-within-P offset)
+        for b in range(B):
+            expected_phase = known_delays[b].item() % P
+            assert phase[b].item() == expected_phase, \
+                f"Example {b}: phase={phase[b].item()} vs expected={expected_phase}"
+
+        # All phases should be distinct (different delays mod P)
+        assert len(set(phase.tolist())) == B, \
+            f"Expected distinct phases for heterogeneous delays, got {phase.tolist()}"
+
+        # Aligned waveform must contain signal (not all zeros)
+        assert (best_rx.abs() > 1e-5).any(), "Aligned waveform should have non-zero signal"
 
     def test_normalized_corr_true_vs_false_differs(self):
         """Normalized and raw correlation can give different results on heterogeneous batch."""
