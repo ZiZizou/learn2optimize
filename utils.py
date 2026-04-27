@@ -111,9 +111,8 @@ def get_channel_generator(args, device=None, samples_per_symbol=1):
 
     # S4P Touchstone channel overrides other channel types
     if getattr(args, 'touchstone_channel', None) is not None:
-        dataset_path = resolve_s4p_dataset_path()
-        if args.touchstone_channel != dataset_path:
-            print(f"[s4p] loading dataset: {dataset_path}")
+        dataset_path = args.touchstone_channel
+        print(f"[s4p] loading dataset: {dataset_path}")
         return S4pChannelGenerator(
             touchstone_file_path=dataset_path,
             snr_range=SNR_RANGE,
