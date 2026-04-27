@@ -124,19 +124,23 @@ class TestScientificBehavior:
         rx_list = []
         for b in range(B):
             delay = known_delays[b].item()
-            impulse = torch.zeros(T * P)
-            impulse[delay::P] = tx_up[b]  # Put tx symbols at delayed positions
-            # Add some noise
-            rx_list.append(impulse + 0.01 * torch.randn(T * P))
+            # Start with noise, insert the upsampled tx at a delayed phase
+            impulse = 0.01 * torch.randn(T * P)
+            # Place tx symbols at every P-th position starting from delay
+            impulse[delay::P] = tx_up[b, :T*P-delay]  # valid portion
+            rx_list.append(impulse)
         rx = torch.stack(rx_list)
 
         best_rx, phase, delay = choose_best_symbol_phase_per_example(
             tx, rx, P, use_normalized_corr=True
         )
 
-        # Per-example delays should match the known inserted delays
-        assert torch.allclose(delay.float(), known_delays.float(), atol=2), \
-            f"Delay recovery failed: recovered {delay} vs expected {known_delays}"
+        # Per-example delays should approximately match the known inserted delays
+        # Allow tolerance of ±2 since we approximate placement
+        recovered = delay.float()
+        expected = known_delays.float()
+        assert torch.allclose(recovered, expected, atol=2), \
+            f"Delay recovery failed: recovered {recovered} vs expected {expected}"
 
     def test_normalized_corr_true_vs_false_differs(self):
         """Normalized and raw correlation can give different results on heterogeneous batch."""
@@ -338,15 +342,19 @@ class TestDownstreamContract:
         assert result.returncode == 1, f"Found 't + common_delay' in migrated files:\n{result.stdout}"
 
     def test_no_t_plus_delay_per_example_indexing(self):
-        """grep 't + delay_per_example' returns zero in all .py files."""
+        """grep 't + delay_per_example' returns zero in migrated operational files."""
         import subprocess
+        # Check only the migrated operational files, not test files or this script
         result = subprocess.run(
-            ['grep', '-r', 't + delay_per_example', '--include=*.py', '.'],
+            ['grep', '-r', 't + delay_per_example',
+             'l2o_basic.py', 'l2o_progressive.py', 'l2o_mlp.py',
+             'l2o_mlp_no_agc.py', 'evaluate_l2o.py', 'benchmark_nlms.py'],
             capture_output=True, text=True
         )
         if result.returncode not in (0, 1):
             pytest.fail(f"grep failed: {result.stderr}")
-        assert result.returncode == 1, f"Found 't + delay_per_example' in files:\n{result.stdout}"
+        # returncode 1 = no matches = PASS
+        assert result.returncode == 1, f"Found 't + delay_per_example' in operational files:\n{result.stdout}"
 
     def test_effective_seq_len_uses_min_pattern(self):
         """effective_seq_len is derived from aligned waveform length."""
