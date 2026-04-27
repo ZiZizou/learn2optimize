@@ -112,16 +112,26 @@ class TestScientificBehavior:
             f"Delay changed under scaling: {delay_ref} vs {delay_sc}"
 
     def test_heterogeneous_delay_recovery(self):
-        """Per-example sync finds different phases for batch elements with distinct delays."""
+        """Per-example sync produces distinct phase/delay pairs for batch elements
+        with non-identical channel delays, and the aligned output is a
+        proper reconstruction of the transmitted signal (not zero, not NaN)."""
         B, T, P = 4, 128, 8
-        torch.manual_seed(42)
+        torch.manual_seed(999)
 
         tx = torch.randn(B, T).sign()
         tx_up = upsample_symbols(tx, P)  # [B, T*P]
 
-        # Each batch element gets a distinct integer-sample delay
-        # by right-shifting (prepending zeros to) the upsampled tx
-        known_delays = torch.tensor([3, 7, 11, 19])
+        # Choose delays pairwise-distinct modulo P so every example
+        # lands on a different phase stream.
+        # P=8, so pick four delays each giving a different delay % 8:
+        #   d0=2  -> phase 2
+        #   d1=9  -> phase 1
+        #   d2=17 -> phase 1  (collision, skip)
+        #   d3=18 -> phase 2  (collision, skip)
+        #   d0=2, d1=9, d2=17, d3=18 gives phases [2,1,1,2] -> still a collision
+        # Use: [0, 1, 2, 3] all distinct mod 8, but also distinct delays
+        known_delays = torch.tensor([0, 1, 2, 3])
+
         rx_list = []
         for b in range(B):
             d = known_delays[b].item()
@@ -130,27 +140,28 @@ class TestScientificBehavior:
                 rx_b[d:] = tx_up[b, :-d]
             else:
                 rx_b[:] = tx_up[b]
-            rx_list.append(rx_b + 0.001 * torch.randn(T * P))
+            rx_list.append(rx_b + 1e-3 * torch.randn(T * P))
         rx = torch.stack(rx_list)
 
         best_rx, phase, delay = choose_best_symbol_phase_per_example(
             tx, rx, P, use_normalized_corr=True
         )
 
-        # Key invariants:
-        # 1. All phases must be distinct (different delays yield different optimal phases)
+        # All phases must be distinct (different delay_mod_P -> different phase stream)
         phase_set = set(phase.tolist())
         assert len(phase_set) == B, \
-            f"Expected distinct phases per example, got phases={phase.tolist()}"
+            f"Expected {B} distinct phases, got {phase.tolist()} (phase_set={phase_set})"
 
-        # 2. All delays must be distinct
+        # All delays must be distinct
         delay_set = set(delay.tolist())
         assert len(delay_set) == B, \
-            f"Expected distinct delays per example, got delays={delay.tolist()}"
+            f"Expected {B} distinct delays, got {delay.tolist()}"
 
-        # 3. The aligned waveform must contain non-zero signal
-        assert (best_rx.abs() > 1e-5).any(), \
-            "Aligned waveform should have non-zero signal"
+        # The aligned output must be a proper reconstruction of tx,
+        # not all-zero and not NaN
+        assert not torch.isnan(best_rx).any(), "Aligned output contains NaN"
+        assert (best_rx.abs() > 1e-4).all(), \
+            "Aligned output should be non-trivially non-zero (signal reconstructed)"
 
     def test_normalized_corr_true_vs_false_differs(self):
         """Normalized and raw correlation can give different results on heterogeneous batch."""
