@@ -447,6 +447,7 @@ def inspect_s4p_directory(
     baud_rate_hz: float = BAUD_RATE_HZ,
     port_pairing: str = "auto",
     transfer_mode: str = "auto",
+    output_file=None,
 ) -> None:
     """
     Inspect all .s4p files in a directory tree and print human-readable reports.
@@ -456,6 +457,7 @@ def inspect_s4p_directory(
         baud_rate_hz: Baud rate in Hz for Nyquist frequency calculation
         port_pairing: Port pairing for 4-port files - "auto", "13-24", "12-34", or "14-23"
         transfer_mode: Transfer extraction mode - "auto", "s21", or "sdd21"
+        output_file: File object to write reports to (default: None = stdout)
     """
     if not HAS_SKRF:
         raise RuntimeError("scikit-rf is required to parse .s4p files. Install with: pip install scikit-rf")
@@ -463,8 +465,13 @@ def inspect_s4p_directory(
     if not base_dir.exists():
         raise FileNotFoundError(f"Directory not found: {base_dir}")
 
-    print(f"Inspecting .s4p files from {base_dir} (recursive)...")
-    print()
+    def write(msg):
+        print(msg)
+        if output_file:
+            output_file.write(msg + "\n")
+
+    write(f"Inspecting .s4p files from {base_dir} (recursive)...")
+    write("")
 
     inspected_count = 0
     for root, dirs, files in os.walk(base_dir):
@@ -477,14 +484,14 @@ def inspect_s4p_directory(
             filepath = pathlib.Path(root) / filename
             try:
                 report = inspect_touchstone_file(filepath, baud_rate_hz)
-                print_inspection_report(report)
-                print()
+                print_inspection_report_to_file(report, output_file=output_file, write_fn=write)
+                write("")
                 inspected_count += 1
             except Exception as e:
-                print(f"Warning: Failed to inspect {filepath}: {e}")
+                write(f"Warning: Failed to inspect {filepath}: {e}")
                 continue
 
-    print(f"Inspected {inspected_count} file(s)")
+    write(f"Inspected {inspected_count} file(s)")
 
 
 # ==========================================
@@ -1394,6 +1401,12 @@ def main():
         action="store_true",
         help="Only inspect Touchstone files and print reports without generating channels."
     )
+    parser.add_argument(
+        "--inspect_output",
+        type=str,
+        default=None,
+        help="Output file path for --inspect_only reports. If not specified, prints to stdout."
+    )
 
     args = parser.parse_args()
 
@@ -1405,12 +1418,20 @@ def main():
     if args.inspect_only:
         if args.s4p_dir is None:
             raise ValueError("--inspect_only requires --s4p_dir to be specified")
+        out_file = None
+        if args.inspect_output:
+            out_file = open(args.inspect_output, 'w', encoding='utf-8')
+            print(f"Writing inspection reports to {args.inspect_output}")
         inspect_s4p_directory(
             pathlib.Path(args.s4p_dir),
             baud_rate_hz=BAUD_RATE_HZ,
             port_pairing=args.port_pairing,
             transfer_mode=args.transfer_mode,
+            output_file=out_file,
         )
+        if out_file:
+            out_file.close()
+            print(f"Inspection complete. Output written to {args.inspect_output}")
         return
 
     if args.dummy_data or args.s4p_dir is None:

@@ -619,73 +619,156 @@ def extract_transfer_function(
     return freq_hz, S[:, 1, 0].copy(), "S21"
 
 
-def print_inspection_report(report: InspectionReport) -> None:
+def print_inspection_report(report: InspectionReport, output_file=None) -> None:
     """
     Print a human-readable inspection report.
 
     Args:
         report: InspectionReport from inspect_touchstone_file().
+        output_file: File object to write to (default: None = stdout)
     """
-    print("=" * 70)
-    print("TOUCHSTONE INSPECTION REPORT")
-    print("=" * 70)
-    print(f"File: {report.metadata.file_path}")
-    print(f"Ports: {report.metadata.nports}")
-    print(f"Format: {report.metadata.format}")
-    print(f"Reference impedance: {report.metadata.reference_impedance:.1f} ohm")
-    print(f"Frequency range: {report.metadata.frequency_hz[0]:.3e} - "
+    def write(msg):
+        print(msg)
+        if output_file:
+            output_file.write(msg + "\n")
+
+    write("=" * 70)
+    write("TOUCHSTONE INSPECTION REPORT")
+    write("=" * 70)
+    write(f"File: {report.metadata.file_path}")
+    write(f"Ports: {report.metadata.nports}")
+    write(f"Format: {report.metadata.format}")
+    write(f"Reference impedance: {report.metadata.reference_impedance:.1f} ohm")
+    write(f"Frequency range: {report.metadata.frequency_hz[0]:.3e} - "
           f"{report.metadata.frequency_hz[-1]:.3e} Hz")
-    print(f"Points: {len(report.metadata.frequency_hz)}")
+    write(f"Points: {len(report.metadata.frequency_hz)}")
 
     if report.metadata.is_mixed_mode:
-        print("Mode: MIXED-MODE")
+        write("Mode: MIXED-MODE")
     else:
-        print("Mode: SINGLE-ENDED representation")
+        write("Mode: SINGLE-ENDED representation")
 
-    print("-" * 70)
+    write("-" * 70)
 
     if report.metadata.nports == 4:
-        print("PORT TOPOLOGY INFERENCE:")
-        print()
+        write("PORT TOPOLOGY INFERENCE:")
+        write("")
 
         if report.port_pairing is not None:
-            print(f"  Best pairing: {report.port_pairing}")
-            print(f"  Suggested transfer: {report.transfer_mode.value}")
-            print()
-            print("  Pairing scores:")
+            write(f"  Best pairing: {report.port_pairing}")
+            write(f"  Suggested transfer: {report.transfer_mode.value}")
+            write("")
+            write("  Pairing scores:")
             for ps in report.pairing_scores:
-                print(f"    {ps.pairing}: score={ps.score:.4f}, "
+                write(f"    {ps.pairing}: score={ps.score:.4f}, "
                       f"thru={ps.thru_strength:.4f}, "
                       f"mode_conv={ps.mode_conversion:.4f}")
         else:
-            print("  Could not confidently infer pairing.")
-            print("  Suggestion: Specify --port_pairing manually.")
+            write("  Could not confidently infer pairing.")
+            write("  Suggestion: Specify --port_pairing manually.")
 
-        print()
+        write("")
 
     # Quality metrics
     if report.quality_metrics:
-        print("QUALITY METRICS:")
-        print(f"  Measured fmax: {report.quality_metrics.get('measured_fmax_hz', 0):.3e} Hz")
-        print(f"  Target Nyquist: {report.quality_metrics.get('target_nyquist_hz', 0):.3e} Hz")
-        print(f"  Bandwidth ratio: {report.quality_metrics.get('bandwidth_ratio', 0):.2f}")
+        write("QUALITY METRICS:")
+        write(f"  Measured fmax: {report.quality_metrics.get('measured_fmax_hz', 0):.3e} Hz")
+        write(f"  Target Nyquist: {report.quality_metrics.get('target_nyquist_hz', 0):.3e} Hz")
+        write(f"  Bandwidth ratio: {report.quality_metrics.get('bandwidth_ratio', 0):.2f}")
 
         if report.quality_metrics.get('bandwidth_ratio', 1.0) < 1.0:
-            print("  WARNING: Measured bandwidth below target Nyquist!")
+            write("  WARNING: Measured bandwidth below target Nyquist!")
 
         if not report.quality_metrics.get('passivity_ok', True):
-            print(f"  WARNING: {report.quality_metrics.get('passivity_violations', 0)} "
+            write(f"  WARNING: {report.quality_metrics.get('passivity_violations', 0)} "
                   "passivity violations detected")
 
         if not report.quality_metrics.get('reciprocity_ok', True):
-            print(f"  WARNING: Reciprocity deviation = "
+            write(f"  WARNING: Reciprocity deviation = "
                   f"{report.quality_metrics.get('reciprocity_deviation', 0):.4f}")
 
     # Warnings
     if report.warnings:
-        print()
-        print("WARNINGS:")
+        write("")
+        write("WARNINGS:")
         for w in report.warnings:
-            print(f"  - {w}")
+            write(f"  - {w}")
 
-    print("=" * 70)
+    write("=" * 70)
+
+
+def print_inspection_report_to_file(report: InspectionReport, output_file=None, write_fn=None) -> None:
+    """
+    Write inspection report to file using a provided write function.
+
+    Args:
+        report: InspectionReport from inspect_touchstone_file().
+        output_file: File object to write to (used to track write state)
+        write_fn: Custom write function (e.g., lambda msg: output_file.write(msg + '\\n'))
+    """
+    if write_fn is None:
+        write_fn = lambda msg: print(msg) if output_file is None else output_file.write(msg + "\n")
+
+    write_fn("=" * 70)
+    write_fn("TOUCHSTONE INSPECTION REPORT")
+    write_fn("=" * 70)
+    write_fn(f"File: {report.metadata.file_path}")
+    write_fn(f"Ports: {report.metadata.nports}")
+    write_fn(f"Format: {report.metadata.format}")
+    write_fn(f"Reference impedance: {report.metadata.reference_impedance:.1f} ohm")
+    write_fn(f"Frequency range: {report.metadata.frequency_hz[0]:.3e} - "
+             f"{report.metadata.frequency_hz[-1]:.3e} Hz")
+    write_fn(f"Points: {len(report.metadata.frequency_hz)}")
+
+    if report.metadata.is_mixed_mode:
+        write_fn("Mode: MIXED-MODE")
+    else:
+        write_fn("Mode: SINGLE-ENDED representation")
+
+    write_fn("-" * 70)
+
+    if report.metadata.nports == 4:
+        write_fn("PORT TOPOLOGY INFERENCE:")
+        write_fn("")
+
+        if report.port_pairing is not None:
+            write_fn(f"  Best pairing: {report.port_pairing}")
+            write_fn(f"  Suggested transfer: {report.transfer_mode.value}")
+            write_fn("")
+            write_fn("  Pairing scores:")
+            for ps in report.pairing_scores:
+                write_fn(f"    {ps.pairing}: score={ps.score:.4f}, "
+                         f"thru={ps.thru_strength:.4f}, "
+                         f"mode_conv={ps.mode_conversion:.4f}")
+        else:
+            write_fn("  Could not confidently infer pairing.")
+            write_fn("  Suggestion: Specify --port_pairing manually.")
+
+        write_fn("")
+
+    # Quality metrics
+    if report.quality_metrics:
+        write_fn("QUALITY METRICS:")
+        write_fn(f"  Measured fmax: {report.quality_metrics.get('measured_fmax_hz', 0):.3e} Hz")
+        write_fn(f"  Target Nyquist: {report.quality_metrics.get('target_nyquist_hz', 0):.3e} Hz")
+        write_fn(f"  Bandwidth ratio: {report.quality_metrics.get('bandwidth_ratio', 0):.2f}")
+
+        if report.quality_metrics.get('bandwidth_ratio', 1.0) < 1.0:
+            write_fn("  WARNING: Measured bandwidth below target Nyquist!")
+
+        if not report.quality_metrics.get('passivity_ok', True):
+            write_fn(f"  WARNING: {report.quality_metrics.get('passivity_violations', 0)} "
+                     "passivity violations detected")
+
+        if not report.quality_metrics.get('reciprocity_ok', True):
+            write_fn(f"  WARNING: Reciprocity deviation = "
+                     f"{report.quality_metrics.get('reciprocity_deviation', 0):.4f}")
+
+    # Warnings
+    if report.warnings:
+        write_fn("")
+        write_fn("WARNINGS:")
+        for w in report.warnings:
+            write_fn(f"  - {w}")
+
+    write_fn("=" * 70)
