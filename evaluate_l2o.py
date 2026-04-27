@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import argparse
 import ast
+import os
 from config import (
     CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
     L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM,
@@ -267,6 +268,11 @@ if __name__ == "__main__":
     burn_in = args.burn_in
     ctle_peaking = args.ctle_peaking
     ablate_ctle = args.ablate_ctle
+
+    if OVERSAMPLE_FACTOR > 1 and not ablate_ctle:
+        print(f"Warning: OVERSAMPLE_FACTOR={OVERSAMPLE_FACTOR} > 1, enabling frequency-domain CTLE (ablate_ctle=True)")
+        ablate_ctle = True
+
     model_paths = args.model_paths
     baseline_mode = BaselineMode(args.baseline_mode)
 
@@ -372,7 +378,7 @@ if __name__ == "__main__":
     if model_paths:
         # Use the explicitly provided model paths
         models_to_test = []
-        for mp in model_paths:
+        for idx, mp in enumerate(model_paths):
             model_type = "rnn"  # Default, user should specify if MLP
             if "mlp" in mp.lower():
                 model_type = "mlp"
@@ -384,8 +390,20 @@ if __name__ == "__main__":
                 mlp_class = MultiRateLearnedMLPNoAGC
             else:
                 mlp_class = MultiRateLearnedMLP
+
+            model_base = os.path.basename(mp)
+            if "l2o_mlp" in model_base.lower():
+                model_arch = "MLP"
+            elif "l2o_basic" in model_base.lower():
+                model_arch = "RNN Basic"
+            elif "l2o_progressive" in model_base.lower():
+                model_arch = "RNN Progressive"
+            else:
+                model_arch = "Custom"
+
+            model_name = f"Custom Model {idx+1} ({model_arch}){ablate_label}"
             models_to_test.append((
-                f"Custom Model{ablate_label}", mp, model_type,
+                model_name, mp, model_type,
                 mlp_class(L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM, use_two_head=is_two_head_model) if model_type == "mlp"
                 else MultiRateLearnedNLMS(6, 32, use_two_head=is_two_head_model)
             ))
