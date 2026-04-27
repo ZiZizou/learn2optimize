@@ -404,8 +404,8 @@ def parse_s4p_directory_tree(
                 )
                 ir_tensor = ir
 
-filename_lower = filename.lower()
-                stem = filename_lower.removesuffix('.s4p')
+                filename_lower = filename.lower()
+                stem = filename_lower[:-4] if filename_lower.endswith('.s4p') else filename_lower
 
                 if 'thru' in filename_lower or stem.endswith('_t'):
                     if group['thru'] is not None:
