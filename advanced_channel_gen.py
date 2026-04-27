@@ -12,6 +12,15 @@ the advanced channel models a physically longer cable with equivalent
 sampling density to the simple channel (which uses t ∈ [0, 5.0] for 50 taps).
 Parameters (tau, gamma, omega0) have been re-tuned to preserve the original
 curve shapes over the scaled time axis.
+
+Scientific Notes on Normalization:
+- Channel IR normalization (pre-convolution scaling) is applied BEFORE
+  time-varying convolution when enabled.
+- This is NOT the same as receiver AGC - receiver AGC is a causal block
+  applied after the physical channel and before CTLE.
+- When normalization is "none", the generator preserves raw amplitude
+  variation from insertion loss, which is the physically correct mode
+  for no-AGC training.
 """
 
 import torch

@@ -9,20 +9,21 @@ import ast
 from config import (
     CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
     L2O_STATE_DIM, L2O_MLP_HISTORY_LEN, L2O_MLP_HIDDEN_DIM,
-    RLS_LAMBDA, RLS_DELTA,
+    RLS_LAMBDA, RLS_DELTA, RLS_DIAGONAL_LOADING,
+    NLMS_MU_FFE, NLMS_MU_DFE, NLMS_EPS_FLOOR, NLMS_RMS_FLOOR,
     VSS_MU_MAX, VSS_MU_MIN, VSS_ALPHA, VSS_GAMMA, VSS_MOMENTUM,
     EVAL_BATCH_SIZE, EVAL_SEQ_LENGTH, EVAL_BURN_IN, FIXED_CTLE_PEAKING,
     OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
+    RMS_EMA_BETA, BASELINE_MODE,
 )
 from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 
-# Import architectures from training scripts
+from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe, BaselineMode
+from utils import add_channel_args, get_channel_generator
+from ctle_frequency_utils import apply_frequency_domain_ctle
 from l2o_basic import MultiRateLearnedNLMS, DifferentiableCTLE, DifferentiableDFE, cross_correlate_sync_batch
 from l2o_mlp import MultiRateLearnedMLP
 from l2o_mlp_no_agc import MultiRateLearnedMLPNoAGC
-from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe
-from utils import add_channel_args, get_channel_generator
-from ctle_frequency_utils import apply_frequency_domain_ctle
 
 def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_peaking=0.5, ablate_ctle=False):
     """
@@ -252,6 +253,12 @@ if __name__ == "__main__":
                         help="Exclude RLS benchmark")
     parser.add_argument("--no_baseline", action="store_true",
                         help="Exclude all baseline algorithms (NLMS, VSS, RLS)")
+    parser.add_argument("--baseline_mode", type=str, default=BASELINE_MODE,
+                        choices=["standard", "no_agc_robust", "calibrated"],
+                        help=f"Baseline mode: 'standard' (vanilla NLMS/RLS), "
+                             "'no_agc_robust' (causal RMS-normalized), "
+                             "'calibrated' (precomputed stats, labeled as upper bound). "
+                             f"Default: {BASELINE_MODE}")
     parser = add_channel_args(parser)
     args = parser.parse_args()
 
@@ -261,12 +268,15 @@ if __name__ == "__main__":
     ctle_peaking = args.ctle_peaking
     ablate_ctle = args.ablate_ctle
     model_paths = args.model_paths
+    baseline_mode = BaselineMode(args.baseline_mode)
 
     # Process strategy selection flags
     include_l2o = args.include_l2o and not args.no_l2o
     include_nlms = args.include_nlms and not args.no_nlms and not args.no_baseline
     include_vss = args.include_vss and not args.no_vss and not args.no_baseline
     include_rls = args.include_rls and not args.no_rls and not args.no_baseline
+
+    use_normalized_corr = (baseline_mode == BaselineMode.NO_AGC_ROBUST)
 
     # Parse VSS MU_MAX values for comparison
     if args.vss_mu_max_values is not None:
@@ -304,6 +314,8 @@ if __name__ == "__main__":
         print("*** NO-AGC MODE: Channel normalization disabled - evaluating with raw physics-preserved voltages ***")
     if ablate_ctle:
         print("*** ABLATION MODE: CTLE updates disabled (matching ABLATE_CTLE=True training) ***")
+    print(f"Baseline Mode: {baseline_mode.value}")
+    print(f"Normalized Correlation Sync: {use_normalized_corr}")
     print("-" * 60)
 
     # Setup environment
@@ -338,6 +350,7 @@ if __name__ == "__main__":
         OVERSAMPLE_FACTOR,
         max_delay=PHASE_SEARCH_MAX_DELAY,
         sync_len=PHASE_SEARCH_SYNC_LEN,
+        use_normalized_corr=use_normalized_corr,
     )
     tx_aligned = tx_symbols
 
@@ -437,31 +450,32 @@ if __name__ == "__main__":
     # Static NLMS Bench (if enabled)
     if include_nlms:
         avg_mse_nlms, nlms_all_dfe, nlms_all_ffe, mu_nlms, ber_nlms = run_batch_nlms_dfe(
-            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False,
+            baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
         )
-        results["NLMS (0.05)"] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item(), ber_nlms)
-        all_ffe_weights["NLMS (0.05)"] = nlms_all_ffe
-        all_dfe_weights["NLMS (0.05)"] = nlms_all_dfe
-        step_size_history["NLMS (0.05)"] = mu_nlms  # Static mu=0.05
+        nlms_label = f"NLMS (0.05) [{baseline_mode.value}]"
+        results[nlms_label] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item(), ber_nlms)
+        all_ffe_weights[nlms_label] = nlms_all_ffe
+        all_dfe_weights[nlms_label] = nlms_all_dfe
+        step_size_history[nlms_label] = mu_nlms
         smoothed_nlms = pd.Series(avg_mse_nlms.numpy()).ewm(span=20).mean()
-        plt.plot(10 * torch.log10(torch.tensor(smoothed_nlms)), '--', label="NLMS mu=0.05", alpha=0.6)
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_nlms)), '--', label=nlms_label, alpha=0.6)
 
     # VSS NLMS Bench (if enabled) - loop over all VSS_MU_MAX values
     if include_vss:
-        # Define line styles/colors for up to 6 configurations
         line_styles = ['--', ':', '-.', '--', ':', '-.']
         colors = ['b', 'm', 'g', 'c', 'orange', 'purple']
         for idx, vss_mu_max_val in enumerate(vss_mu_max_values):
             style = line_styles[idx % len(line_styles)]
             color = colors[idx % len(colors)]
-            label_vss = f"NLMS VSS (μ_max={vss_mu_max_val})"
-            label_vss_mom = f"NLMS VSS (μ_max={vss_mu_max_val}, Mom={VSS_MOMENTUM})"
+            label_vss = f"NLMS VSS (μ_max={vss_mu_max_val}) [{baseline_mode.value}]"
+            label_vss_mom = f"NLMS VSS (μ_max={vss_mu_max_val}, Mom={VSS_MOMENTUM}) [{baseline_mode.value}]"
 
-            # VSS NLMS (no momentum)
             avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss, ber_vss = run_batch_nlms_dfe(
                 rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
                 use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
-                vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA
+                vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA,
+                baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
             )
             results[label_vss] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item(), ber_vss)
             all_ffe_weights[label_vss] = vss_all_ffe
@@ -470,12 +484,12 @@ if __name__ == "__main__":
             smoothed_vss = pd.Series(avg_mse_vss.numpy()).ewm(span=20).mean()
             plt.plot(10 * torch.log10(torch.tensor(smoothed_vss)), f'{color}{style}', label=label_vss, alpha=0.6)
 
-            # VSS NLMS with Momentum (if momentum is enabled and not suppressed)
             if VSS_MOMENTUM != 0.0 and not args.no_vss_nlms_mom:
                 avg_mse_vss_mom, vss_mom_all_dfe, vss_mom_all_ffe, mu_vss_mom, ber_vss_mom = run_batch_nlms_dfe(
                     rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
                     use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
-                    vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM
+                    vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM,
+                    baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
                 )
                 results[label_vss_mom] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item(), ber_vss_mom)
                 all_ffe_weights[label_vss_mom] = vss_mom_all_ffe
@@ -486,19 +500,20 @@ if __name__ == "__main__":
 
     # RLS Bench (if enabled)
     if include_rls:
-        # Dynamically scale delta based on signal variance for better RLS initialization
         signal_variance = torch.var(rx_aligned).item()
         dynamic_delta = RLS_DELTA * signal_variance
         print(f"Signal Variance: {signal_variance:.6f}, Dynamic RLS Delta: {dynamic_delta:.6e}")
         avg_mse_rls, rls_all_combined, ber_rls = run_batch_rls_dfe(
-            rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False
+            rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False,
+            baseline_mode=baseline_mode, diagonal_loading=RLS_DIAGONAL_LOADING,
+            mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
         )
-        results["RLS"] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item(), ber_rls)
-        # RLS combines FFE and DFE into one weight vector [FFE_TAPS + DFE_TAPS]
-        all_ffe_weights["RLS"] = [w[:FFE_TAPS] for w in rls_all_combined]
-        all_dfe_weights["RLS"] = [w[FFE_TAPS:] for w in rls_all_combined]
+        rls_label = f"RLS [{baseline_mode.value}]"
+        results[rls_label] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item(), ber_rls)
+        all_ffe_weights[rls_label] = [w[:FFE_TAPS] for w in rls_all_combined]
+        all_dfe_weights[rls_label] = [w[FFE_TAPS:] for w in rls_all_combined]
         smoothed_rls = pd.Series(avg_mse_rls.numpy()).ewm(span=20).mean()
-        plt.plot(10 * torch.log10(torch.tensor(smoothed_rls)), 'k:', label="RLS Baseline", linewidth=2)
+        plt.plot(10 * torch.log10(torch.tensor(smoothed_rls)), 'k:', label=rls_label, linewidth=2)
 
     # Final Reporting
     print("\nComparison Table (Evaluation on {} symbols, batch-avg):".format(seq_len))
@@ -519,7 +534,7 @@ if __name__ == "__main__":
             avg_ss_mu = torch.mean(mu_trace[burn_in:]).item() if len(mu_trace) > burn_in else torch.mean(mu_trace).item()
             final_ss_mu = mu_trace[-1].item() if len(mu_trace) > 0 else 0.0
             print(f"{name:<35} | {avg_ss_mu:<15.6f} | {final_ss_mu:<18.6f}")
-        elif name == "RLS":
+        elif "RLS" in name:
             print(f"{name:<35} | {'N/A (RLS)':<15} | {'N/A (forgetting λ)':<18}")
         else:
             print(f"{name:<35} | {'N/A':<15} | {'N/A':<18}")

@@ -7,6 +7,13 @@ realistic SerDes channel behavior with crosstalk from FEXT/NEXT aggressors.
 The physics model: The receiver voltage is the linear superposition of the
 main signal (victim) and all crosstalk interference. Crosstalk aggressors
 are driven by independent, uncorrelated random bit sequences.
+
+Scientific Notes on Normalization:
+- Channel IR normalization is pre-convolution scaling of the impulse response.
+- This is NOT the same as receiver AGC.
+- When enabled, ONE normalization scalar is computed from THRU and applied to
+  ALL of THRU, FEXT, and NEXT to preserve relative crosstalk-to-signal ratios.
+- Normalizing only THRU would distort the physical crosstalk-to-signal ratios.
 """
 
 import torch
@@ -154,10 +161,15 @@ class S4pChannelGenerator:
 
         h_thru_batch = torch.stack(h_thru_padded).squeeze(1)  # [batch_size, max_taps]
 
-        # Normalize thru channel (peak normalization) unless disabled
+        # Channel IR normalization (pre-convolution scaling)
+        # When enabled, compute ONE normalization scalar from THRU and apply to ALL
+        # (THRU + all FEXT + all NEXT) to preserve relative crosstalk-to-signal ratios.
+        # Normalizing only THRU would distort THRU/FEXT/NEXT amplitude relationships.
+        norm_scale = None
         if not self.disable_agc:
             peak_vals, _ = torch.max(torch.abs(h_thru_batch), dim=1, keepdim=True)
-            h_thru_batch = h_thru_batch / (peak_vals + 1e-8)
+            norm_scale = 1.0 / (peak_vals + 1e-8)  # [batch, 1]
+            h_thru_batch = h_thru_batch * norm_scale  # [batch, max_taps]
 
         # Reshape thru for convolution
         h_thru_reshaped = h_thru_batch.unsqueeze(1)  # [batch_size, 1, max_taps]
@@ -178,15 +190,15 @@ class S4pChannelGenerator:
                     tx_aggressor = self._generate_aggressor_bits(seq_len)
 
                     # Convolve with FEXT impulse response
-                    # Ensure h_fext is at least 1D, then reshape to [1, 1, num_taps]
                     h_fext_1d = h_fext.flatten()
+                    if norm_scale is not None:
+                        h_fext_1d = h_fext_1d * norm_scale[i].squeeze()
                     h_fext_reshaped = h_fext_1d.unsqueeze(0).unsqueeze(1)  # [1, 1, num_taps]
 
                     rx_fext = self._convolve_1d(
                         tx_aggressor.unsqueeze(0),
                         h_fext_reshaped
                     )
-                    # rx_fext has shape [1, output_len], index with [0] not [i]
                     rx_total[i] += rx_fext[0]
 
             # Handle NEXT (Near-End Crosstalk)
@@ -196,15 +208,15 @@ class S4pChannelGenerator:
                     tx_aggressor = self._generate_aggressor_bits(seq_len)
 
                     # Convolve with NEXT impulse response
-                    # Ensure h_next is at least 1D, then reshape to [1, 1, num_taps]
                     h_next_1d = h_next.flatten()
+                    if norm_scale is not None:
+                        h_next_1d = h_next_1d * norm_scale[i].squeeze()
                     h_next_reshaped = h_next_1d.unsqueeze(0).unsqueeze(1)  # [1, 1, num_taps]
 
                     rx_next = self._convolve_1d(
                         tx_aggressor.unsqueeze(0),
                         h_next_reshaped
                     )
-                    # rx_next has shape [1, output_len], index with [0] not [i]
                     rx_total[i] += rx_next[0]
 
         # 3. Add AWGN

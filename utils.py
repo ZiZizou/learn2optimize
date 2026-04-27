@@ -45,9 +45,20 @@ def add_channel_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--disable_agc",
         action="store_true",
-        help="Disable automatic gain control (AGC) normalization. When enabled, channel "
-             "impulse responses preserve true insertion loss physics with raw, attenuated "
-             "voltages rather than being normalized to unit peak/L2 norm."
+        help="DEPRECATED: Use --channel_ir_norm_mode=none instead. "
+             "Disables channel IR normalization to preserve true insertion loss "
+             "physics with raw, attenuated voltages rather than being normalized "
+             "to unit peak/L2 norm. This is NOT receiver AGC - it is pre-convolution "
+             "IR scaling."
+    )
+    parser.add_argument(
+        "--channel_ir_norm_mode",
+        type=str,
+        choices=["none", "peak", "l2"],
+        default=None,
+        help="Channel impulse response normalization mode: 'none' preserves raw "
+             "amplitude (for no-AGC training), 'peak' normalizes peak to 1, "
+             "'l2' normalizes L2 norm to 1. Default: 'peak' for backward compat."
     )
     parser.add_argument(
         "--touchstone_channel",
@@ -65,7 +76,7 @@ def get_channel_generator(args, device=None, samples_per_symbol=1):
     Factory function that returns the appropriate channel generator based on args.
 
     Args:
-        args: Parsed command-line arguments (must contain channel_type attribute).
+        args: Parsed command-line arguments.
         device: Optional torch device to pass to the advanced generator.
         samples_per_symbol: Number of samples per symbol for channel time grid.
 
@@ -74,6 +85,29 @@ def get_channel_generator(args, device=None, samples_per_symbol=1):
         S4pChannelGenerator instance.
     """
     disable_agc = getattr(args, 'disable_agc', False)
+    norm_mode = getattr(args, 'channel_ir_norm_mode', None)
+
+    if disable_agc and norm_mode is not None and norm_mode != "none":
+        raise ValueError(
+            "Conflicting arguments: --disable_agc and --channel_ir_norm_mode "
+            "cannot both be set. Use --channel_ir_norm_mode=none instead of --disable_agc."
+        )
+
+    if disable_agc and norm_mode is None:
+        import warnings
+        warnings.warn(
+            "DEPRECATED: --disable_agc is deprecated. "
+            "Use --channel_ir_norm_mode=none instead. "
+            "This is NOT receiver AGC - it is pre-convolution IR scaling.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        norm_mode = "none"
+
+    if norm_mode is None:
+        norm_mode = "peak"  # Legacy default
+
+    is_raw_mode = (norm_mode == "none")
 
     # S4P Touchstone channel overrides other channel types
     if getattr(args, 'touchstone_channel', None) is not None:
@@ -83,7 +117,7 @@ def get_channel_generator(args, device=None, samples_per_symbol=1):
         return S4pChannelGenerator(
             touchstone_file_path=dataset_path,
             snr_range=SNR_RANGE,
-            disable_agc=disable_agc,
+            disable_agc=is_raw_mode,
             samples_per_symbol=samples_per_symbol,
         )
 
@@ -92,13 +126,13 @@ def get_channel_generator(args, device=None, samples_per_symbol=1):
             num_taps=CH_TAPS,
             snr_range=SNR_RANGE,
             device=device,
-            disable_agc=disable_agc,
+            disable_agc=is_raw_mode,
             samples_per_symbol=samples_per_symbol
         )
     else:
         return WirelineChannelGenerator(
             num_taps=CH_TAPS,
             snr_range=SNR_RANGE,
-            disable_agc=disable_agc,
+            disable_agc=is_raw_mode,
             samples_per_symbol=samples_per_symbol
         )

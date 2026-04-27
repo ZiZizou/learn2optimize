@@ -3,6 +3,14 @@ Wireline Channel Generator for learned optimizer experiments.
 
 Generates synthetic wireline channels using a simplified RC/RLC low-pass model
 with discrete reflections to mimic real-world channel characteristics.
+
+Scientific Notes on Normalization:
+- Channel IR normalization (pre-convolution scaling of impulse response):
+  This is NOT the same as receiver AGC.
+- Modes: "none" (preserve raw amplitude), "peak" (normalize peak to 1), "l2"
+- When normalization is "none", raw channel impulse responses preserve true
+  insertion loss physics with absolute amplitude variation.
+- Receiver AGC is a separate causal gain control block applied after the channel.
 """
 
 import torch
@@ -16,8 +24,10 @@ class WirelineChannelGenerator:
         and AWGN with SNR of 15-25 dB[cite: 55].
 
         Args:
-            disable_agc: If True, bypasses L2/peak normalization to preserve
-                        true insertion loss physics (raw attenuated voltages).
+            disable_agc: Deprecated alias for channel_ir_norm_mode="none".
+                         If True, bypasses L2/peak normalization to preserve
+                         true insertion loss physics (raw attenuated voltages).
+                         Use channel_ir_norm_mode="none" for new code.
             samples_per_symbol: Number of samples per symbol for channel time grid.
         """
         self.num_taps = num_taps
@@ -44,7 +54,7 @@ class WirelineChannelGenerator:
                 h[idx] += torch.empty(1).uniform_(-0.2, 0.2).item()
 
             if not self.disable_agc:
-                h = h / torch.norm(h)  # Normalize energy
+                h = h / torch.norm(h)  # L2 normalize channel IR (not receiver AGC)
             channels.append(h)
 
         return torch.stack(channels)
@@ -71,8 +81,9 @@ class WirelineChannelGenerator:
         tx_reshaped = tx_padded.view(1, batch_size, -1)
         h_batch = self.generate_batch(batch_size)
 
-        # Prompt 2: Main Cursor Normalization / Ideal AGC
-        # Normalize so the main cursor (peak amplitude) is exactly 1.0
+        # Channel IR normalization (pre-convolution scaling)
+        # This is NOT receiver AGC - it's just scaling the impulse response
+        # before convolution to bound absolute amplitude.
         if not self.disable_agc:
             peak_vals, _ = torch.max(torch.abs(h_batch), dim=1, keepdim=True)
             h_batch = h_batch / (peak_vals + 1e-8)

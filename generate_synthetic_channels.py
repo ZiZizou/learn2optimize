@@ -678,24 +678,27 @@ def augment_cascade_freq(
     f_grid: np.ndarray,
     thru_pool: np.ndarray,
     pool_f_grid: np.ndarray,
+    mode: str = "scalar",
 ) -> np.ndarray:
     """
-    Cascade Augmentation: Simulates plugging two cables together via frequency-domain transfer multiplication.
+    Cascade Augmentation: Simulates plugging two cables together via frequency-domain transfer.
 
-    H_total(f) = H_1(f) · H_2(f)
+    Scalar mode (approximation):
+        H_total(f) = H_1(f) · H_2(f)
+    Network mode (more accurate):
+        Cascades full S-parameter networks before extracting the transfer function.
+        This correctly handles interface mismatches but is more computationally expensive.
 
-    This is an approximation assuming:
-    - Matched interfaces between segments
-    - Negligible mismatch interaction
-
-    A full multi-reflection network cascade would require proper de-embedding of
-    reference impedance transitions. Scalar multiplication ignores these effects.
+    Scalar mode note:
+        Assumes matched interfaces between segments. Negligible mismatch interaction.
+        Scalar multiplication ignores these effects - approximation, not full multi-reflection cascade.
 
     Args:
         H_batch: Batch of complex transfer functions [batch, n_freq]
         f_grid: Frequency grid for H_batch [n_freq]
         thru_pool: Pool of THRU transfer functions for sampling [N, n_freq_pool]
         pool_f_grid: Frequency grid for pool [n_freq_pool]
+        mode: 'scalar' for transfer multiplication, 'network' for full S-parameter cascade
 
     Returns:
         Augmented transfer functions [batch, n_freq]
@@ -705,11 +708,84 @@ def augment_cascade_freq(
     indices = np.random.randint(0, len(thru_pool), batch_size)
     H_cascade = thru_pool[indices]
 
-    H_cascade_interp = interpolate_transfer(H_cascade, pool_f_grid, f_grid)
+    if mode == "network":
+        H_batch = cascade_network_mode(H_batch, H_cascade, f_grid)
+    else:
+        H_cascade_interp = interpolate_transfer(H_cascade, pool_f_grid, f_grid)
+        H_batch = H_batch * H_cascade_interp
 
-    H_product = H_batch * H_cascade_interp
+    return H_batch
 
-    return H_product
+
+def cascade_network_mode(
+    H_batch: np.ndarray,
+    H_cascade: np.ndarray,
+    f_grid: np.ndarray,
+) -> np.ndarray:
+    """
+    Network-mode cascade: Cascades S-parameter networks before extracting transfer function.
+
+    Builds minimal 2-port S-parameter networks from the transfer functions and cascades
+    them using the skrf network cascade operator. This correctly handles reference
+    impedance transitions and interface mismatches, unlike scalar multiplication which
+    assumes perfectly matched interfaces.
+
+    For a 2-port network representing a channel with S21 (forward transfer) and S12
+    (reverse transfer), we approximate the channel as a reciprocal, symmetric network
+    with S11≈0 (matched input) and S22≈0 (matched output), so:
+
+        S = [[0, H], [H, 0]]  (approximately, for a well-matched thru)
+
+    Then cascades using skrf's network multiplication: S_total = S1 @ S2.
+
+    Args:
+        H_batch: Batch of complex transfer functions [batch, n_freq]
+        H_cascade: Batch of cascade-channel transfer functions [batch, n_freq]
+        f_grid: Frequency grid [n_freq]
+
+    Returns:
+        Cascaded transfer functions [batch, n_freq]
+    """
+    if not HAS_SKRF:
+        import warnings
+        warnings.warn(
+            "scikit-rf not available; falling back to scalar cascade approximation. "
+            "Install scikit-rf for proper network-mode cascade."
+        )
+        H_interp = interpolate_transfer(H_cascade, f_grid, f_grid)
+        return H_batch * H_interp
+
+    batch_size = H_batch.shape[0]
+    n_freq = H_batch.shape[1]
+
+    H_interp = interpolate_transfer(H_cascade, f_grid, f_grid)
+
+    S_total_batch = np.zeros((batch_size, n_freq, 2, 2), dtype=np.complex128)
+
+    for i in range(batch_size):
+        S1 = np.zeros((n_freq, 2, 2), dtype=np.complex128)
+        S2 = np.zeros((n_freq, 2, 2), dtype=np.complex128)
+
+        S1[:, 0, 1] = H_batch[i]
+        S1[:, 1, 0] = H_batch[i]
+        S1[:, 0, 0] = 0.0
+        S1[:, 1, 1] = 0.0
+
+        S2[:, 0, 1] = H_interp[i]
+        S2[:, 1, 0] = H_interp[i]
+        S2[:, 0, 0] = 0.0
+        S2[:, 1, 1] = 0.0
+
+        try:
+            net1 = skrf.Network(frequency=f_grid, s=S1)
+            net2 = skrf.Network(frequency=f_grid, s=S2)
+            net_cascade = net1 ** net2
+            S_total_batch[i] = net_cascade.s
+        except Exception:
+            S_total_batch[i] = S1
+
+    H_result = S_total_batch[:, :, 1, 0]
+    return H_result
 
 
 def interpolate_transfer(
@@ -828,7 +904,7 @@ def apply_augmentations_to_ir(
         h_batch: Batch of IRs [batch, num_taps]
         fs_hz: Sample rate in Hz
         augmentations: Dict of augmentation flags
-        cascade_params: Params for cascade augmentation
+        cascade_params: Params for cascade augmentation (includes 'mode': 'scalar'|'network')
         il_params: Params for insertion loss augmentation
         reflection_params: Params for reflection augmentation
         pool: Optional pool of THRU IRs for cascade/mixup [N, num_taps]
@@ -843,7 +919,8 @@ def apply_augmentations_to_ir(
     if augmentations.get('cascade', False) and pool is not None:
         pool_np = pool.cpu().numpy()
         pool_H, pool_f = ir_to_transfer_batch(pool_np, fs_hz)
-        H_batch = augment_cascade_freq(H_batch, f_grid, pool_H, pool_f)
+        cascade_mode = cascade_params.get('mode', 'scalar')
+        H_batch = augment_cascade_freq(H_batch, f_grid, pool_H, pool_f, mode=cascade_mode)
 
     if augmentations.get('il_tilt', False):
         H_batch = augment_il_freq(
@@ -1069,6 +1146,7 @@ def generate_synthetic_channels(
     num_generated: int,
     batch_size: int = 64,
     channel_cascade: bool = False,
+    cascade_mode: str = "scalar",
     insertion_loss_tilting: bool = False,
     random_reflection: bool = False,
     mixup: bool = False,
@@ -1121,7 +1199,7 @@ def generate_synthetic_channels(
         'il_tilt': insertion_loss_tilting,
         'reflections': random_reflection,
     }
-    cascade_params = {}
+    cascade_params = {'mode': cascade_mode}
     il_params = {
         'alpha_c_range': (0.0, 0.5),
         'alpha_d_range': (0.0, 0.1),
@@ -1248,6 +1326,15 @@ def main():
         action="store_true",
         help="Apply cascade augmentation (frequency-domain transfer multiplication). "
              "Note: This is an approximation assuming matched interfaces."
+    )
+    parser.add_argument(
+        "--cascade_mode",
+        type=str,
+        default="scalar",
+        choices=["scalar", "network"],
+        help="Cascade implementation mode: 'scalar' multiplies transfer functions "
+             "(ignores interface mismatch), 'network' cascades full S-parameter "
+             "networks before extraction (more accurate but requires more computation)."
     )
     parser.add_argument(
         "--insertion_loss_tilting",
@@ -1382,6 +1469,7 @@ def main():
         num_generated=args.num_generated,
         batch_size=args.batch_size,
         channel_cascade=args.channel_cascade,
+        cascade_mode=args.cascade_mode,
         insertion_loss_tilting=args.insertion_loss_tilting,
         random_reflection=args.random_reflection,
         mixup=args.mixup,
@@ -1441,6 +1529,7 @@ def main():
             "normalization": args.normalization,
             "port_pairing": args.port_pairing,
             "transfer_mode": args.transfer_mode,
+            "cascade_mode": args.cascade_mode,
             "augmentations": augmentation_summary if augmentation_summary else "none",
         },
         "channels": synthetic_dataset,

@@ -3,19 +3,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import pandas as pd
+from enum import Enum
 
 from config import (
     CH_TAPS, SNR_RANGE, DFE_TAPS, CTLE_TAPS, FFE_TAPS, FFE_MAIN_CURSOR, FFE_INIT,
-    RLS_LAMBDA, RLS_DELTA, NLMS_MU_VALUES,
+    RLS_LAMBDA, RLS_DELTA, RLS_DIAGONAL_LOADING,
+    NLMS_MU_VALUES, NLMS_MU_FFE, NLMS_MU_DFE, NLMS_EPS_FLOOR, NLMS_RMS_FLOOR,
     VSS_MU_MAX, VSS_MU_MIN, VSS_ALPHA, VSS_GAMMA, VSS_MOMENTUM,
     FIXED_PEAKING, EVAL_SEQ_LENGTH,
-    VSS_MU_MAX, VSS_MU_MIN, VSS_ALPHA, VSS_GAMMA, VSS_MOMENTUM,
+    RMS_EMA_BETA, BASELINE_MODE,
     OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
 )
 from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 from wireline_channel import WirelineChannelGenerator
 from s4p_channel import S4pChannelGenerator
 from ctle_frequency_utils import apply_frequency_domain_ctle
+
+
+class BaselineMode(Enum):
+    STANDARD = "standard"
+    NO_AGC_ROBUST = "no_agc_robust"
+    CALIBRATED = "calibrated"
+
+
+def causal_rms(x, eps=NLMS_EPS_FLOOR):
+    return torch.sqrt(x.pow(2).mean(dim=1, keepdim=True) + eps)
+
+
+def causal_ema_rms(x, ema_prev, beta=RMS_EMA_BETA, eps=NLMS_EPS_FLOOR):
+    return torch.sqrt(beta * ema_prev.pow(2) + (1 - beta) * x.pow(2) + eps)
+
+
+def normalize_regressor_causal(x, rms_floor=NLMS_RMS_FLOOR, eps=NLMS_EPS_FLOOR):
+    rms = causal_rms(x, eps=eps)
+    return x / rms.clamp_min(rms_floor)
 
 # DifferentiableCTLE not needed for benchmark (uses frequency-domain CTLE only)
 
@@ -24,7 +45,9 @@ from ctle_frequency_utils import apply_frequency_domain_ctle
 # ==========================================
 def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forcing=True,
                  use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
-                 vss_momentum=0.0, use_soft_decision=True, tau=0.1):
+                 vss_momentum=0.0, use_soft_decision=True, tau=0.1,
+                 baseline_mode=BaselineMode.STANDARD, mu_ffe=None, mu_dfe=None,
+                 rms_floor=NLMS_RMS_FLOOR, ema_beta=RMS_EMA_BETA):
     """
     NLMS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -44,74 +67,75 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
                       Typical values: 0.9 or 0.95 for momentum-enabled updates
         use_soft_decision: If True, use tanh(eq_out/tau) soft decisions; if False, use hard sign decisions
         tau: Soft decision temperature parameter (default: 0.1)
+        baseline_mode: STANDARD (vanilla NLMS) or NO_AGC_ROBUST (causal RMS-normalized FFE)
+        mu_ffe: FFE step size (no-AGC robust mode, default=NLMS_MU_FFE)
+        mu_dfe: DFE step size (no-AGC robust mode, default=NLMS_MU_DFE)
+        rms_floor: Minimum RMS value for causal normalization (no-AGC robust mode)
+        ema_beta: EMA decay for RMS normalization (no-AGC robust mode)
     """
     seq_len = rx_signal.shape[0]
     weights = torch.zeros(num_taps, dtype=torch.float32)
 
-    # Initialize Multi-Tap FFE with center tap = FFE_INIT
     w_ffe = torch.zeros(FFE_TAPS, dtype=torch.float32)
     w_ffe[FFE_MAIN_CURSOR] = FFE_INIT
     ffe_buffer = torch.zeros(FFE_TAPS, dtype=torch.float32)
 
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
     mse_log = []
-    mu_log = []  # Track step sizes
+    mu_log = []
     hard_decision_log = []
     target_log = []
 
-    # Initialize momentum buffers for heavy-ball optimization
     dfe_momentum_buffer = torch.zeros(num_taps, dtype=torch.float32)
     ffe_momentum_buffer = torch.zeros(FFE_TAPS, dtype=torch.float32)
 
-    # Step size selection: static or continuous VSS
+    is_robust = (baseline_mode == BaselineMode.NO_AGC_ROBUST)
+    use_efe_ffe = mu_ffe if mu_ffe is not None else NLMS_MU_FFE
+    use_efe_dfe = mu_dfe if mu_dfe is not None else NLMS_MU_DFE
+    ema_rms_sq = None
+
     if use_vss:
-        current_mu = vss_mu_max  # Start fast for rapid acquisition
+        current_mu = vss_mu_max
     else:
-        current_mu = mu        # Use static mu
+        current_mu = mu
 
     for t in range(seq_len):
-        # Shift FFE buffer and insert newest sample at index 0
         ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=0)
         ffe_buffer[0] = rx_signal[t]
 
-        # DFE feedback computation
         feedback = torch.dot(decision_buffer, weights)
 
-        # Causality shift: target symbol is at t - FFE_MAIN_CURSOR
         target_idx = t - FFE_MAIN_CURSOR
         if target_idx >= 0:
-            # Compute FFE output (dot product)
             ffe_out = torch.dot(w_ffe, ffe_buffer)
-            # Total equalizer output
             eq_out = ffe_out - feedback
             decision = torch.tanh(eq_out / tau) if use_soft_decision else (torch.sign(eq_out) if eq_out != 0 else 1.0)
             e_t = tx_symbols[target_idx] - eq_out
             mse_log.append((e_t.item())**2)
             mu_log.append(current_mu)
 
-            # BER: use hard decision (sign) for detection, compare to tx
             hard_dec = torch.sign(eq_out) if eq_out != 0 else 1.0
             hard_decision_log.append(hard_dec.item())
             target_log.append(tx_symbols[target_idx].item())
 
-            # Continuous Variable Step-Size (VSS) Update
             if use_vss:
                 current_mu = (vss_alpha * current_mu) + (vss_gamma * (e_t.item() ** 2))
                 current_mu = max(vss_mu_min, min(vss_mu_max, current_mu))
 
-            # Normalization includes full FFE buffer energy and feedback buffer
-            norm_sq = torch.dot(ffe_buffer, ffe_buffer) + torch.dot(decision_buffer, decision_buffer) + eps
+            if is_robust:
+                ffe_rms_sq = ffe_buffer.pow(2).mean() + eps
+                ffe_dir = ffe_buffer / torch.sqrt(ffe_rms_sq).clamp_min(rms_floor)
+                dfe_dir = decision_buffer
+                inst_grad_ffe = use_efe_ffe * e_t * ffe_dir
+                inst_grad_dfe = use_efe_dfe * e_t * dfe_dir
+            else:
+                norm_sq = torch.dot(ffe_buffer, ffe_buffer) + torch.dot(decision_buffer, decision_buffer) + eps
+                inst_grad_dfe = (current_mu * e_t * decision_buffer) / norm_sq
+                inst_grad_ffe = (current_mu * e_t * ffe_buffer) / norm_sq
 
-            # Calculate instantaneous gradients scaled by current_mu
-            inst_grad_dfe = (current_mu * e_t * decision_buffer) / norm_sq
-            inst_grad_ffe = (current_mu * e_t * ffe_buffer) / norm_sq
-
-            # Update momentum buffers (Heavy-ball momentum)
             dfe_momentum_buffer = (vss_momentum * dfe_momentum_buffer) + inst_grad_dfe
             ffe_momentum_buffer = (vss_momentum * ffe_momentum_buffer) + inst_grad_ffe
 
-            # Apply updates to weights using momentum
-            # DFE subtracts feedback, FFE adds it (standard DFE math)
             weights = weights - dfe_momentum_buffer
             w_ffe = w_ffe + ffe_momentum_buffer
 
@@ -121,19 +145,15 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
             else:
                 decision_buffer[0] = decision
         else:
-            # Warmup phase: not enough history for valid error computation
-            # Log zero error but still build up ffe_buffer
             mse_log.append(0.0)
             mu_log.append(current_mu)
 
-            # Update feedback weights with zero error (no learning)
             decision_buffer = torch.roll(decision_buffer, shifts=1)
             if teacher_forcing:
                 decision_buffer[0] = tx_symbols[t]
             else:
                 decision_buffer[0] = 0.0
 
-    # Compute BER (all valid symbols)
     hard_decisions = torch.tensor(hard_decision_log)
     targets = torch.tensor(target_log)
     ber_all = torch.mean((hard_decisions != targets).float()).item()
@@ -216,7 +236,10 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
 # ==========================================
 # 3b. RLS Algorithm with Multi-Tap FFE
 # ==========================================
-def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_forcing=True, use_soft_decision=True, tau=0.1):
+def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_forcing=True,
+                use_soft_decision=True, tau=0.1, baseline_mode=BaselineMode.STANDARD,
+                diagonal_loading=RLS_DIAGONAL_LOADING, rms_floor=NLMS_RMS_FLOOR,
+                mu_ffe=None, mu_dfe=None):
     """
     RLS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -231,18 +254,20 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
     Parameters:
         use_soft_decision: If True, use tanh(eq_out/tau) soft decisions; if False, use hard sign decisions
         tau: Soft decision temperature parameter (default: 0.1)
+        baseline_mode: STANDARD (vanilla RLS) or NO_AGC_ROBUST (causal RMS-normalized with diagonal loading)
+        diagonal_loading: Added to P diagonal for numerical stability (no-AGC robust mode)
+        rms_floor: Minimum RMS value for causal normalization (no-AGC robust mode)
+        mu_ffe: FFE step size override (no-AGC robust mode, default=None uses full RLS gain)
+        mu_dfe: DFE step size override (no-AGC robust mode, default=None uses full RLS gain)
     """
     seq_len = rx_signal.shape[0]
-    system_order = FFE_TAPS + num_taps  # FFE_TAPS forward + num_taps feedback
+    system_order = FFE_TAPS + num_taps
 
-    # Initialize weights with center tap = 1.0
     weights = torch.zeros(system_order, dtype=torch.float32)
-    weights[FFE_MAIN_CURSOR] = 1.0  # Center tap initialized to 1.0
+    weights[FFE_MAIN_CURSOR] = 1.0
 
-    # Initialize inverse correlation matrix P_0 = delta^(-1) * I
     P = torch.eye(system_order, dtype=torch.float32) / delta
 
-    # Initialize FFE buffer and decision buffer
     ffe_buffer = torch.zeros(FFE_TAPS, dtype=torch.float32)
     decision_buffer = torch.zeros(num_taps, dtype=torch.float32)
 
@@ -250,19 +275,23 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
     hard_decision_log = []
     target_log = []
 
+    is_robust = (baseline_mode == BaselineMode.NO_AGC_ROBUST)
+    use_efe_ffe = mu_ffe if mu_ffe is not None else 1.0
+    use_efe_dfe = mu_dfe if mu_dfe is not None else 1.0
+
     for t in range(seq_len):
-        # Shift FFE buffer and insert newest sample at index 0
         ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=0)
         ffe_buffer[0] = rx_signal[t]
 
-        # Causality shift: target symbol is at t - FFE_MAIN_CURSOR
         target_idx = t - FFE_MAIN_CURSOR
 
-        # 1. Construct augmented input: u_t = [ffe_buffer, -decision_buffer]
-        # Negate decision buffer so RLS naturally subtracts feedback (aligns with DFE)
-        u_t = torch.cat([ffe_buffer, -decision_buffer]).unsqueeze(1)  # [system_order, 1]
+        if is_robust:
+            ffe_rms_sq = ffe_buffer.pow(2).mean() + 1e-6
+            ffe_dir = ffe_buffer / torch.sqrt(ffe_rms_sq).clamp_min(rms_floor)
+            u_t = torch.cat([ffe_dir, -decision_buffer]).unsqueeze(1)
+        else:
+            u_t = torch.cat([ffe_buffer, -decision_buffer]).unsqueeze(1)
 
-        # 2. Filter output and error
         all_feedback = torch.dot(weights, u_t.squeeze())
         eq_out = all_feedback
 
@@ -270,27 +299,30 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
             e_t = tx_symbols[target_idx] - eq_out
             mse_log.append((e_t.item()) ** 2)
 
-            # BER: use hard decision (sign) for detection, compare to tx
             hard_dec = torch.sign(eq_out) if eq_out != 0 else 1.0
             hard_decision_log.append(hard_dec.item())
             target_log.append(tx_symbols[target_idx].item())
 
-            # 3. Compute Kalman Gain vector: k_t = P * u_t / (lambda + u_t^T * P * u_t)
-            P_u = torch.matmul(P, u_t)  # [system_order, 1]
-            u_P_u = torch.matmul(u_t.t(), P_u)  # [1, 1] scalar
+            P_u = torch.matmul(P, u_t)
+            u_P_u = torch.matmul(u_t.t(), P_u)
 
-            # k_t = P * u_t / (lambda + u_t^T * P * u_t)
             denom = lam + u_P_u.squeeze()
-            k_t = P_u / denom  # [system_order, 1]
+            k_t = P_u / denom
 
-            # 4. Weight Update: w_t = w_{t-1} + k_t * e_t (addition for RLS)
-            weights = weights + (k_t.squeeze() * e_t)
+            if is_robust:
+                k_fffe = k_t[:FFE_TAPS] * use_efe_ffe
+                k_dfef = k_t[FFE_TAPS:] * use_efe_dfe
+                k_t_scaled = torch.cat([k_fffe, k_dfef])
+                weights = weights + (k_t_scaled.squeeze() * e_t)
+            else:
+                weights = weights + (k_t.squeeze() * e_t)
 
-            # 5. Update Inverse Correlation Matrix: P_t = (P_{t-1} - k_t * u_t^T * P_{t-1}) / lambda
-            k_u_t = torch.matmul(k_t, u_t.t())  # [system_order, system_order]
+            k_u_t = torch.matmul(k_t, u_t.t())
             P = (P - torch.matmul(k_u_t, P)) / lam
 
-            # 6. Make decision and update shift register
+            if is_robust and diagonal_loading > 0:
+                P = P + diagonal_loading * torch.eye(system_order, dtype=torch.float32)
+
             decision = torch.tanh(eq_out / tau) if use_soft_decision else (torch.sign(eq_out) if eq_out != 0 else 1.0)
             decision_buffer = torch.roll(decision_buffer, shifts=1)
             if teacher_forcing:
@@ -298,17 +330,14 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
             else:
                 decision_buffer[0] = decision
         else:
-            # Warmup phase: not enough history for valid error computation
             mse_log.append(0.0)
 
-            # Update shift register with current symbol but no weight update
             decision_buffer = torch.roll(decision_buffer, shifts=1)
             if teacher_forcing:
                 decision_buffer[0] = tx_symbols[t]
             else:
                 decision_buffer[0] = 0.0
 
-    # Compute BER (all valid symbols)
     hard_decisions = torch.tensor(hard_decision_log)
     targets = torch.tensor(target_log)
     ber_all = torch.mean((hard_decisions != targets).float()).item()
@@ -320,7 +349,9 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
 # ==========================================
 def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_forcing=False,
                        use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
-                       vss_momentum=0.0, use_soft_decision=True, tau=0.1):
+                       vss_momentum=0.0, use_soft_decision=True, tau=0.1,
+                       baseline_mode=BaselineMode.STANDARD, mu_ffe=None, mu_dfe=None,
+                       rms_floor=NLMS_RMS_FLOOR, ema_beta=RMS_EMA_BETA):
     """
     Wrapper to run NLMS DFE over a batch of channels.
 
@@ -335,8 +366,9 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
         avg_mu_history: Averaged step size across batch dimension [seq_len] (for VSS)
 
     Parameters:
-        use_soft_decision: If True, use tanh soft decisions; if False, use hard sign decisions
-        tau: Soft decision temperature parameter (default: 0.1)
+        baseline_mode: STANDARD or NO_AGC_ROBUST
+        mu_ffe, mu_dfe: Separate step sizes (no-AGC robust mode)
+        rms_floor, ema_beta: Causal normalization params (no-AGC robust mode)
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
@@ -346,14 +378,16 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
     ber_list = []
 
     for i in range(batch_size):
-        rx_i = rx_batch[i]  # [seq_len]
-        tx_i = tx_batch[i]  # [seq_len]
+        rx_i = rx_batch[i]
+        tx_i = tx_batch[i]
 
         mse_history, weights, w_main, mu_history, ber = run_nlms_dfe(
             rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
             use_vss=use_vss, vss_mu_max=vss_mu_max, vss_mu_min=vss_mu_min,
             vss_alpha=vss_alpha, vss_gamma=vss_gamma, vss_momentum=vss_momentum,
-            use_soft_decision=use_soft_decision, tau=tau
+            use_soft_decision=use_soft_decision, tau=tau,
+            baseline_mode=baseline_mode, mu_ffe=mu_ffe, mu_dfe=mu_dfe,
+            rms_floor=rms_floor, ema_beta=ema_beta
         )
         mse_histories.append(mse_history)
         mu_histories.append(mu_history)
@@ -361,12 +395,11 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
         all_ffe_weights.append(w_main.cpu().numpy())
         ber_list.append(ber)
 
-    # Stack and average across batch
-    mse_stacked = torch.stack(mse_histories, dim=0)  # [batch_size, seq_len]
-    avg_mse_history = torch.mean(mse_stacked, dim=0)   # [seq_len]
+    mse_stacked = torch.stack(mse_histories, dim=0)
+    avg_mse_history = torch.mean(mse_stacked, dim=0)
 
-    mu_stacked = torch.stack(mu_histories, dim=0)  # [batch_size, seq_len]
-    avg_mu_history = torch.mean(mu_stacked, dim=0)   # [seq_len]
+    mu_stacked = torch.stack(mu_histories, dim=0)
+    avg_mu_history = torch.mean(mu_stacked, dim=0)
     avg_ber = torch.mean(torch.tensor(ber_list)).item()
 
     return avg_mse_history, all_dfe_weights, all_ffe_weights, avg_mu_history, avg_ber
@@ -375,7 +408,10 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
 # ==========================================
 # 3d. Batch RLS Wrapper
 # ==========================================
-def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teacher_forcing=False, use_soft_decision=True, tau=0.1):
+def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teacher_forcing=False,
+                      use_soft_decision=True, tau=0.1, baseline_mode=BaselineMode.STANDARD,
+                      diagonal_loading=RLS_DIAGONAL_LOADING, rms_floor=NLMS_RMS_FLOOR,
+                      mu_ffe=None, mu_dfe=None):
     """
     Wrapper to run RLS DFE over a batch of channels.
 
@@ -388,8 +424,9 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
         final_weights: Final combined weights (FFE + DFE) from last channel [FFE_TAPS + num_taps]
 
     Parameters:
-        use_soft_decision: If True, use tanh soft decisions; if False, use hard sign decisions
-        tau: Soft decision temperature parameter (default: 0.1)
+        baseline_mode: STANDARD or NO_AGC_ROBUST
+        diagonal_loading: Added to P diagonal (no-AGC robust mode)
+        mu_ffe, mu_dfe: Separate step size scaling (no-AGC robust mode)
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
@@ -397,12 +434,14 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
     ber_list = []
 
     for i in range(batch_size):
-        rx_i = rx_batch[i]  # [seq_len]
-        tx_i = tx_batch[i]  # [seq_len]
+        rx_i = rx_batch[i]
+        tx_i = tx_batch[i]
 
         mse_history, weights, ber = run_rls_dfe(
             rx_i, tx_i, num_taps=num_taps, lam=lam, delta=delta, teacher_forcing=teacher_forcing,
-            use_soft_decision=use_soft_decision, tau=tau
+            use_soft_decision=use_soft_decision, tau=tau,
+            baseline_mode=baseline_mode, diagonal_loading=diagonal_loading,
+            rms_floor=rms_floor, mu_ffe=mu_ffe, mu_dfe=mu_dfe
         )
         mse_histories.append(mse_history)
         all_combined_weights.append(weights.cpu().numpy())
@@ -475,7 +514,17 @@ if __name__ == "__main__":
     parser.add_argument("--synthetic_channel", type=str, default=None,
                         help="Path to .pt file with synthetic channel data (e.g. synthetic_channels.pt). "
                              "If not provided, generates random channels using WirelineChannelGenerator.")
+    parser.add_argument("--baseline_mode", type=str, default="standard",
+                        choices=["standard", "no_agc_robust", "calibrated"],
+                        help="Baseline mode: 'standard' (vanilla NLMS/RLS), "
+                             "'no_agc_robust' (causal RMS-normalized), "
+                             "'calibrated' (precomputed stats, labeled as upper bound)")
+    parser.add_argument("--disable_agc", action="store_true",
+                        help="Disable AGC in channel generation (use with no_agc_robust mode)")
     args = parser.parse_args()
+
+    baseline_mode = BaselineMode(args.baseline_mode)
+    use_normalized_corr = (baseline_mode == BaselineMode.NO_AGC_ROBUST)
 
     use_soft_list = []
     if args.decision_type in ["soft", "both"]:
@@ -500,6 +549,8 @@ if __name__ == "__main__":
     print(f"SNR Range: {SNR_RANGE} dB")
     print(f"Batch Size: {BENCH_BATCH_SIZE}")
     print(f"Decision Type: {args.decision_type}")
+    print(f"Baseline Mode: {baseline_mode.value}")
+    print(f"Normalized Correlation Sync: {use_normalized_corr}")
     print("-" * 30)
 
     # 1. Generate or load test data (batch of channels)
@@ -511,12 +562,14 @@ if __name__ == "__main__":
         gen = S4pChannelGenerator(
             touchstone_file_path=args.synthetic_channel,
             snr_range=SNR_RANGE,
-            disable_agc=False,
+            disable_agc=args.disable_agc,
             samples_per_symbol=OVERSAMPLE_FACTOR,
         )
         rx_raw, h_true = gen.generate_received_signal(tx_frontend, batch_size=BENCH_BATCH_SIZE)
     else:
-        gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE, samples_per_symbol=OVERSAMPLE_FACTOR)
+        gen = WirelineChannelGenerator(num_taps=CH_TAPS, snr_range=SNR_RANGE,
+                                       samples_per_symbol=OVERSAMPLE_FACTOR,
+                                       disable_agc=args.disable_agc)
         rx_raw, h_true = gen.generate_received_signal(tx_frontend, batch_size=BENCH_BATCH_SIZE)
 
     # 2. Apply Fixed CTLE (frequency-domain path only for oversampling)
@@ -528,12 +581,14 @@ if __name__ == "__main__":
     )
 
     # 3. Phase selection and decimation to symbol rate
+    # Use normalized correlation in no-AGC robust mode for amplitude-invariant sync
     rx_aligned, best_phase, common_delay = choose_best_symbol_phase(
         tx,
         rx_ctle,
         OVERSAMPLE_FACTOR,
         max_delay=PHASE_SEARCH_MAX_DELAY,
         sync_len=PHASE_SEARCH_SYNC_LEN,
+        use_normalized_corr=use_normalized_corr,
     )
     tx_aligned = tx
 
@@ -572,7 +627,8 @@ if __name__ == "__main__":
         for mu_val in mu_values:
             avg_mse_history, nlms_all_dfe, nlms_all_ffe, mu_nlms, ber_nlms = run_batch_nlms_dfe(
                 rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=mu_val, teacher_forcing=False,
-                use_soft_decision=use_soft
+                use_soft_decision=use_soft, baseline_mode=baseline_mode,
+                mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
             )
 
             # 1. Acquisition MSE (Average of symbols 0-500)
@@ -594,7 +650,8 @@ if __name__ == "__main__":
         avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss, ber_vss = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
             use_vss=True, vss_mu_max=VSS_MU_MAX, vss_mu_min=VSS_MU_MIN,
-            vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, use_soft_decision=use_soft
+            vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, use_soft_decision=use_soft,
+            baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
         )
         acq_mse_vss = torch.mean(avg_mse_vss[:500]).item()
         acq_mse_vss_db = 10 * torch.log10(torch.tensor(acq_mse_vss)).item()
@@ -612,7 +669,8 @@ if __name__ == "__main__":
         avg_mse_history_rls, final_w_rls, ber_rls = run_batch_rls_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS,
             lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False,
-            use_soft_decision=use_soft
+            use_soft_decision=use_soft, baseline_mode=baseline_mode,
+            diagonal_loading=RLS_DIAGONAL_LOADING, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
         )
 
         acq_mse_rls = torch.mean(avg_mse_history_rls[:500]).item()
