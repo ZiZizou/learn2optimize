@@ -14,7 +14,7 @@ from config import (
     RMS_EMA_BETA, BASELINE_MODE,
     OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
 )
-from oversampling_utils import choose_best_symbol_phase, upsample_symbols
+from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
 from wireline_channel import WirelineChannelGenerator
 from s4p_channel import S4pChannelGenerator
 from ctle_frequency_utils import apply_frequency_domain_ctle
@@ -582,7 +582,7 @@ if __name__ == "__main__":
 
     # 3. Phase selection and decimation to symbol rate
     # Use normalized correlation in no-AGC robust mode for amplitude-invariant sync
-    rx_aligned, best_phase, common_delay = choose_best_symbol_phase(
+    rx_aligned, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
         tx,
         rx_ctle,
         OVERSAMPLE_FACTOR,
@@ -592,8 +592,11 @@ if __name__ == "__main__":
     )
     tx_aligned = tx
 
+    delay_min = int(delay_per_example.min().item())
+    delay_median = int(delay_per_example.float().median().item())
+    delay_max = int(delay_per_example.max().item())
     print(f"Oversample factor: {OVERSAMPLE_FACTOR}, Best phase: {best_phase}")
-    print(f"Synchronized main cursor - Median delay: {common_delay}")
+    print(f"Sync delay stats: min={delay_min}, median={delay_median}, max={delay_max}")
     print(f"Aligned sequence length: {tx_aligned.shape[1]}")
     print("-" * 30)
 

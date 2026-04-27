@@ -26,6 +26,9 @@ def choose_best_symbol_phase(
     use_normalized_corr: bool = False,
 ):
     """
+    Legacy batch-global sync. Do not use for S4P-derived heterogeneous channels.
+    Kept only for backward compatibility / ablation reproduction.
+
     Find best phase and integer delay for symbol synchronization.
 
     Args:
@@ -100,6 +103,7 @@ def choose_best_symbol_phase_per_example(
     oversample_factor: int,
     max_delay: int = 64,
     sync_len: int = 128,
+    use_normalized_corr: bool = True,
 ):
     """
     Per-example normalized-correlation sync for amplitude-invariant delay selection.
@@ -115,14 +119,19 @@ def choose_best_symbol_phase_per_example(
         oversample_factor: samples per symbol
         max_delay: maximum search delay in symbols
         sync_len: number of symbols to use for sync correlation
+        use_normalized_corr: if True, use normalized correlation (default, recommended)
 
     Returns:
         best_rx: [batch, seq_len] phase-aligned received signal per example
         best_phase_per_example: [batch] integer phase per example
         best_delay_per_example: [batch] integer delay per example
+
+    IMPORTANT: The returned best_rx is already synchronized. Downstream code must
+    index it as best_rx[:, t:t+1], NOT best_rx[:, t + best_delay].
     """
     return choose_best_symbol_phase_per_example_vectorized(
-        tx_symbols, rx_oversampled, oversample_factor, max_delay, sync_len
+        tx_symbols, rx_oversampled, oversample_factor, max_delay, sync_len,
+        use_normalized_corr=use_normalized_corr,
     )
 
 
@@ -133,6 +142,7 @@ def choose_best_symbol_phase_per_example_vectorized(
     oversample_factor: int,
     max_delay: int = 64,
     sync_len: int = 128,
+    use_normalized_corr: bool = True,
 ):
     """
     Vectorized per-example normalized-correlation sync for amplitude-invariant delay selection.
@@ -146,11 +156,15 @@ def choose_best_symbol_phase_per_example_vectorized(
         oversample_factor: samples per symbol
         max_delay: maximum search delay in symbols
         sync_len: number of symbols to use for sync correlation
+        use_normalized_corr: if True, use normalized correlation (default, recommended)
 
     Returns:
         best_rx: [batch, seq_len] phase-aligned received signal per example
         best_phase: [batch] integer phase per example
         best_delay: [batch] integer delay per example
+
+    IMPORTANT: The returned best_rx is already synchronized. Downstream code must
+    index it as best_rx[:, t:t+1], NOT best_rx[:, t + best_delay].
     """
     if oversample_factor == 1:
         return rx_oversampled, torch.zeros(tx_symbols.shape[0], dtype=torch.long, device=tx_symbols.device), \
@@ -183,8 +197,12 @@ def choose_best_symbol_phase_per_example_vectorized(
 
     tx_norm = tx_ref.pow(2).sum(dim=-1).sqrt().view(B, 1, 1)
     corr = (windows * tx_ref[:, None, None, :]).sum(dim=-1).abs()
-    win_norm = windows.pow(2).sum(dim=-1).sqrt()
-    rho = corr / (tx_norm * win_norm + 1e-6)
+
+    if use_normalized_corr:
+        win_norm = windows.pow(2).sum(dim=-1).sqrt()
+        rho = corr / (tx_norm * win_norm + 1e-6)
+    else:
+        rho = corr
 
     neg_inf = torch.finfo(rho.dtype).min
     rho = rho.masked_fill(~valid_mask, neg_inf)
@@ -205,5 +223,10 @@ def choose_best_symbol_phase_per_example_vectorized(
     sample_ids = torch.arange(seq_len, device=rx_oversampled.device)
     gather_idx = best_delay_clamped[:, None] + sample_ids[None, :]
     best_rx = best_phase_stream.gather(1, gather_idx)
+
+    assert best_phase.dtype == torch.long, f"best_phase dtype {best_phase.dtype} expected torch.long"
+    assert best_delay.dtype == torch.long, f"best_delay dtype {best_delay.dtype} expected torch.long"
+    assert best_rx.ndim == 2, f"best_rx ndim {best_rx.ndim} expected 2"
+    assert best_rx.shape[0] == tx_symbols.shape[0], f"best_rx batch {best_rx.shape[0]} expected {tx_symbols.shape[0]}"
 
     return best_rx, best_phase.long(), best_delay_clamped.long()

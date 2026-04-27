@@ -17,7 +17,7 @@ from config import (
     OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
     RMS_EMA_BETA, BASELINE_MODE,
 )
-from oversampling_utils import choose_best_symbol_phase, upsample_symbols
+from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
 
 from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe, BaselineMode
 from utils import add_channel_args, get_channel_generator
@@ -54,12 +54,13 @@ def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_pe
                 )
             rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-        rx_init, best_phase, common_delay = choose_best_symbol_phase(
+        rx_init, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
             tx_symbols,
             rx_frontend,
             OVERSAMPLE_FACTOR,
             max_delay=PHASE_SEARCH_MAX_DELAY,
             sync_len=PHASE_SEARCH_SYNC_LEN,
+            use_normalized_corr=True,
         )
 
     # Initialize state
@@ -82,18 +83,16 @@ def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_pe
     target_log = []
 
     with torch.no_grad():
-        effective_len = seq_len - common_delay
+        effective_len = min(rx_init.shape[1], seq_len)
         for t in range(effective_len):
             if ablate_ctle:
-                # O(1) fetch from pre-computed continuous-time waveform
-                # The CTLE was already applied as a static LTI pre-filter
-                rx_eq = rx_init[:, (t + common_delay):(t + common_delay + 1)]
+                rx_eq = rx_init[:, t:t+1]
 
                 # CTLE is static; use fixed peaking gain
                 # Must be [batch_size, 1] to match tensor shapes in torch.cat
                 ctle_peaking = torch.full((batch_size, 1), 0.5, device=latent_peaking.device)
             else:
-                rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
+                rx_t = rx_base[:, t:t+1]
                 ctle_peaking = torch.sigmoid(latent_peaking)
 
                 rx_buffer = torch.roll(rx_buffer, shifts=1, dims=1)
@@ -350,7 +349,7 @@ if __name__ == "__main__":
             )
         rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-    rx_aligned, best_phase, common_delay = choose_best_symbol_phase(
+    rx_aligned, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
         tx_symbols,
         rx_frontend,
         OVERSAMPLE_FACTOR,
@@ -360,8 +359,11 @@ if __name__ == "__main__":
     )
     tx_aligned = tx_symbols
 
+    delay_min = int(delay_per_example.min().item())
+    delay_median = int(delay_per_example.float().median().item())
+    delay_max = int(delay_per_example.max().item())
     print(f"Batch size: {batch_size}, Oversample factor: {OVERSAMPLE_FACTOR}")
-    print(f"Best phase: {best_phase}, Median delay: {common_delay}")
+    print(f"Best phase: {best_phase}, Delay stats: min={delay_min}, median={delay_median}, max={delay_max}")
     print("-" * 60)
 
     results = {}

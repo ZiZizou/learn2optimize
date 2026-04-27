@@ -11,7 +11,7 @@ from config import (
     ABLATE_CTLE, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE,
     PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
 )
-from oversampling_utils import choose_best_symbol_phase, upsample_symbols
+from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
 
 # ==========================================
 # MLP-Based Learned Optimizer
@@ -234,12 +234,13 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     )
                 rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
 
-            rx_init, best_phase, common_delay = choose_best_symbol_phase(
+            rx_init, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
                 tx_symbols,
                 rx_frontend,
                 OVERSAMPLE_FACTOR,
                 max_delay=PHASE_SEARCH_MAX_DELAY,
                 sync_len=PHASE_SEARCH_SYNC_LEN,
+                use_normalized_corr=True,
             )
 
         # Initialize DFE weights
@@ -269,7 +270,7 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
         # Initially filled with zeros (neutral state)
         history_buffer = torch.zeros(batch_size, history_len, state_dim)
 
-        effective_seq_len = total_seq_len - common_delay
+        effective_seq_len = min(rx_init.shape[1], tx_symbols.shape[1])
         epoch_total_mse = 0
         epoch_ss_mse = 0  # Steady-state MSE (after burn-in)
         num_steps = 0
@@ -293,14 +294,12 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
 
             for t in range(t_start, t_start + current_block_len):
                 if ablate_ctle:
-                    # O(1) fetch from pre-computed continuous-time waveform
-                    # The CTLE was already applied as a static LTI pre-filter
-                    rx_eq = rx_init[:, (t + common_delay):(t + common_delay + 1)]
+                    rx_eq = rx_init[:, t:t+1]
 
                     # CTLE is static; use fixed peaking gain
                     ctle_peaking = torch.full((batch_size, 1), 0.5, device=latent_peaking.device)
                 else:
-                    rx_t = rx_base[:, (t + common_delay):(t + common_delay + 1)]
+                    rx_t = rx_base[:, t:t+1]
 
                     # Compute physical CTLE gain from latent parameter
                     ctle_peaking = torch.sigmoid(latent_peaking)
