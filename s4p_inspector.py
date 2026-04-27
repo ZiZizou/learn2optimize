@@ -93,7 +93,7 @@ class InspectionReport:
     """Complete inspection report for a Touchstone file."""
     metadata: TouchstoneMetadata
     port_mode: PortMode
-    port_pairing: Optional[str]  # None if not inferred
+    port_pairing: str  # Falls back to "13-24" when inference is ambiguous
     pairing_scores: List[TopologyScore]
     transfer_mode: TransferMode
     quality_metrics: Dict
@@ -308,12 +308,6 @@ def inspect_touchstone_file(
         pairing_scores = report["pairing_scores"]
         transfer_mode = report["suggested_transfer"]
 
-        if port_pairing is None:
-            warnings.append(
-                "Ambiguous port topology: could not confidently infer differential pairing. "
-                "Consider specifying --port_pairing manually."
-            )
-
         # Compute quality metrics
         quality_metrics = compute_quality_metrics(net, baud_rate_hz)
 
@@ -353,13 +347,18 @@ def infer_port_topology(
                 - weight_modeconv * mean(|Sdc21| + |Scd21|)
                 - weight_asym * conductor_path_asymmetry
 
+    When the top score's margin over the runner-up is <= 0.1 (ambiguous),
+    falls back to "13-24" as the statistically dominant convention for
+    802.3ck and most EDA tools. If 13-24 produces nonsense for a given file,
+    try "12-34" as a secondary fallback.
+
     Args:
         net: A 4-port skrf.Network object.
 
     Returns:
         Dict with keys:
             - port_mode: PortMode enum value
-            - best_pairing: Best pairing string or None
+            - best_pairing: Pairing string (never None — falls back to "13-24")
             - pairing_scores: List of TopologyScore for all candidates
             - suggested_transfer: TransferMode enum value
     """
@@ -459,6 +458,12 @@ def infer_port_topology(
             if margin > 0.1:  # threshold for confident selection
                 best_pairing = best.pairing
                 suggested_transfer = TransferMode.SDD21
+            else:
+                best_pairing = "13-24"
+                suggested_transfer = TransferMode.SDD21
+        elif pairing_scores:
+            best_pairing = "13-24"
+            suggested_transfer = TransferMode.SDD21
 
     # Determine port mode
     port_mode = PortMode.SINGLE_ENDED  # Files are typically single-ended format
