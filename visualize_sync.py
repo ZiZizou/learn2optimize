@@ -19,23 +19,41 @@ from config import OVERSAMPLE_FACTOR, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_
 from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
 
 
-def load_s4p_channels(path: str):
-    """Load S4P channel dicts from a .pt file."""
-    data = torch.load(path, map_location='cpu', weights_only=False)
-    if isinstance(data, dict):
-        return [data]
-    if isinstance(data, (list, tuple)):
-        return list(data)
-    raise ValueError(f"Unknown format in {path}: {type(data)}")
+def load_channels_auto(path: str):
+    """Load channel dicts, auto-detecting IR and SNR key names."""
+    raw = torch.load(path, map_location='cpu', weights_only=False)
+    if isinstance(raw, dict):
+        channels = [raw]
+    elif isinstance(raw, (list, tuple)):
+        channels = list(raw)
+    else:
+        raise ValueError(f"Unknown channel file format: {type(raw)}")
+
+    # Auto-detect key names
+    IR_KEYS = ['channel_ir', 'h', 'ir', 'impulse_response', 'coeffs']
+    SNR_KEYS = ['snr', 'SNR', 'snr_db', 'noise_snr']
+
+    def _find(d, keys):
+        for k in keys:
+            if k in d:
+                return d[k]
+        raise KeyError(f"None of {keys} found in channel dict. Available keys: {list(d.keys())}")
+
+    out = []
+    for ch in channels:
+        ir = _find(ch, IR_KEYS)
+        snr = _find(ch, SNR_KEYS)
+        out.append({'ir': ir, 'snr': snr})
+    return out
 
 
 def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1]."""
     return F.conv1d(
-        tx_upsampled.unsqueeze(0).unsqueeze(0),   # [1, 1, T]
-        h.unsqueeze(0).unsqueeze(0),                # [1, 1, K]
+        tx_upsampled.unsqueeze(0).unsqueeze(0),
+        h.unsqueeze(0).unsqueeze(0),
         padding=0
-    ).squeeze()  # [T + K - 1]
+    ).squeeze()
 
 
 def main():
@@ -55,7 +73,7 @@ def main():
 
     # --- Load ---
     print(f"Loading: {args.channel_pt}")
-    all_channels = load_s4p_channels(args.channel_pt)
+    all_channels = load_channels_auto(args.channel_pt)
     print(f"  -> {len(all_channels)} channel(s) available")
 
     n_ch = min(args.n_channels, len(all_channels))
@@ -80,8 +98,8 @@ def main():
 
     for b in range(B):
         ch = all_channels[ch_indices[b]]
-        h = ch['channel_ir']  # [K]
-        snr_db = ch.get('snr', 30.0)
+        h = ch['ir']  # [K]
+        snr_db = ch['snr']
 
         raw = convolve_channel(tx_up[b], h)  # [T_up + K - 1]
 
