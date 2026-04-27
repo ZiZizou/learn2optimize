@@ -119,6 +119,9 @@ def main():
         snr_db = ch['snr']
 
         raw = convolve_channel(tx_up[b], h)  # [T_up + K - 1]
+        if raw.ndim == 0:
+            raw = raw.unsqueeze(0)
+        raw = raw.to(torch.float32)
 
         # Add channel-specific noise
         sig_pow = raw.pow(2).mean()
@@ -134,12 +137,13 @@ def main():
     print(f"  -> RX batch shape: {rx_batch.shape}")
 
     # --- Run per-example sync ---
+    sync_len = min(PHASE_SEARCH_SYNC_LEN, seq_len)
     best_rx, phase, delay = choose_best_symbol_phase_per_example(
         tx_symbols,
         rx_batch,
         OVERSAMPLE_FACTOR,
         max_delay=PHASE_SEARCH_MAX_DELAY,
-        sync_len=PHASE_SEARCH_SYNC_LEN,
+        sync_len=sync_len,
         use_normalized_corr=True,
     )
 
