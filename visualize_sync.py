@@ -20,16 +20,20 @@ from oversampling_utils import choose_best_symbol_phase_per_example, upsample_sy
 
 
 def load_channels_auto(path: str):
-    """Load channel dicts, auto-detecting IR and SNR key names."""
+    """Load channel dicts, auto-detecting IR and SNR key names and top-level structure."""
     raw = torch.load(path, map_location='cpu', weights_only=False)
-    if isinstance(raw, dict):
-        channels = [raw]
+
+    # Top-level may be a list of channels directly, or a dict with 'channels' key
+    if isinstance(raw, dict) and 'channels' in raw:
+        channels = list(raw['channels'])
     elif isinstance(raw, (list, tuple)):
         channels = list(raw)
+    elif isinstance(raw, dict):
+        channels = [raw]
     else:
         raise ValueError(f"Unknown channel file format: {type(raw)}")
 
-    # Auto-detect key names
+    # Auto-detect key names for IR and SNR within each channel dict
     IR_KEYS = ['channel_ir', 'h', 'ir', 'impulse_response', 'coeffs']
     SNR_KEYS = ['snr', 'SNR', 'snr_db', 'noise_snr']
 
