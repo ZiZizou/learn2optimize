@@ -412,10 +412,10 @@ def parse_s4p_directory_tree(
                         print(f"  Warning: Multiple thru files in {root}, using first")
                     group['thru'] = ir_tensor
 
-                elif 'fext' in filename_lower or (stem.endswith('_f') and stem[-1].isdigit()):
+                elif 'fext' in filename_lower or (len(stem) >= 3 and stem[-3] == '_' and stem[-2] == 'f' and stem[-1].isdigit()):
                     group['fext'].append(ir_tensor)
 
-                elif 'next' in filename_lower or (stem.endswith('_n') and stem[-1].isdigit()):
+                elif 'next' in filename_lower or (len(stem) >= 3 and stem[-3] == '_' and stem[-2] == 'n' and stem[-1].isdigit()):
                     group['next'].append(ir_tensor)
 
                 else:
