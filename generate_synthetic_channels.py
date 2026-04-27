@@ -404,21 +404,21 @@ def parse_s4p_directory_tree(
                 )
                 ir_tensor = ir
 
-                filename_lower = filename.lower()
+filename_lower = filename.lower()
+                stem = filename_lower.removesuffix('.s4p')
 
-                if 'thru' in filename_lower:
+                if 'thru' in filename_lower or stem.endswith('_t'):
                     if group['thru'] is not None:
                         print(f"  Warning: Multiple thru files in {root}, using first")
                     group['thru'] = ir_tensor
 
-                elif 'fext' in filename_lower:
+                elif 'fext' in filename_lower or (stem.endswith('_f') and stem[-2].isdigit()):
                     group['fext'].append(ir_tensor)
 
-                elif 'next' in filename_lower:
+                elif 'next' in filename_lower or (stem.endswith('_n') and stem[-2].isdigit()):
                     group['next'].append(ir_tensor)
 
                 else:
-                    # If no classification, try to use as thru anyway
                     if group['thru'] is None:
                         print(f"  Warning: Could not classify {filename}, treating as thru")
                         group['thru'] = ir_tensor
