@@ -22,6 +22,7 @@ from oversampling_utils import choose_best_symbol_phase, upsample_symbols
 from wireline_channel import WirelineChannelGenerator
 from utils import add_channel_args, get_channel_generator
 from ctle_frequency_utils import apply_frequency_domain_ctle
+from l2o_mlp_no_agc import MultiRateLearnedMLPNoAGC, train_learned_optimizer as train_learned_optimizer_no_agc
 
 # ==========================================
 # 2. Differentiable Parametric CTLE
@@ -490,12 +491,26 @@ if __name__ == "__main__":
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
 
     # Create MLP-based optimizer instead of RNN
-    learned_opt = MultiRateLearnedMLP(
-        state_dim=L2O_STATE_DIM,
-        history_len=L2O_MLP_HISTORY_LEN,
-        hidden_dim=L2O_MLP_HIDDEN_DIM,
-        use_two_head=args.two_head
-    )
+    no_agc_mode = (args.channel_ir_norm_mode == "none")
+    if no_agc_mode:
+        learned_opt = MultiRateLearnedMLPNoAGC(
+            state_dim=NO_AGC_STATE_DIM,
+            history_len=L2O_MLP_HISTORY_LEN,
+            hidden_dim=L2O_MLP_HIDDEN_DIM,
+            use_two_head=args.two_head
+        )
+        print("!!! Running in NO-AGC mode (auto-selected: channel_ir_norm_mode=none) !!!")
+        print(f"Using no-AGC MLP optimizer with state_dim={NO_AGC_STATE_DIM}")
+        print(f"Normalization: StreamingFeatureNormalizer + build_no_agc_state")
+        print(f"FFE/DFE heads: separate (mu_ffe, mu_dfe)")
+        print(f"Error direction: smooth tanh(e_t/ERR_DIR_TAU) during training")
+    else:
+        learned_opt = MultiRateLearnedMLP(
+            state_dim=L2O_STATE_DIM,
+            history_len=L2O_MLP_HISTORY_LEN,
+            hidden_dim=L2O_MLP_HIDDEN_DIM,
+            use_two_head=args.two_head
+        )
 
     print(f"Channel type: {args.channel_type}")
     print(f"Channel taps: {CH_TAPS}")
@@ -511,17 +526,36 @@ if __name__ == "__main__":
 
     # Train the learned optimizer
     print("Starting meta-training with MLP optimizer...")
-    trained_model, loss_history, ss_history = train_learned_optimizer(
-        channel_gen=channel_gen,
-        dfe=dfe,
-        ctle=ctle,
-        learned_opt=learned_opt,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        unroll_len=UNROLL_LEN,
-        history_len=L2O_MLP_HISTORY_LEN,
-        ablate_ctle=ABLATE_CTLE
-    )
+    if no_agc_mode:
+        trained_model, loss_history, ss_history = train_learned_optimizer_no_agc(
+            channel_gen=channel_gen,
+            dfe=dfe,
+            ctle=ctle,
+            learned_opt=learned_opt,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            unroll_len=UNROLL_LEN,
+            history_len=L2O_MLP_HISTORY_LEN,
+            ablate_ctle=ABLATE_CTLE
+        )
+        suffix = "_ablate_ctle" if ABLATE_CTLE else ""
+        two_head_suffix = "_two_head" if args.two_head else ""
+        model_path = f"./models/l2o_mlp_noagc_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth"
+    else:
+        trained_model, loss_history, ss_history = train_learned_optimizer(
+            channel_gen=channel_gen,
+            dfe=dfe,
+            ctle=ctle,
+            learned_opt=learned_opt,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            unroll_len=UNROLL_LEN,
+            history_len=L2O_MLP_HISTORY_LEN,
+            ablate_ctle=ABLATE_CTLE
+        )
+        suffix = "_ablate_ctle" if ABLATE_CTLE else ""
+        two_head_suffix = "_two_head" if args.two_head else ""
+        model_path = f"./models/l2o_mlp_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth"
 
     print("-" * 50)
     print("Meta-training completed!")
@@ -539,9 +573,6 @@ if __name__ == "__main__":
     print(f"Final stage (last 20%) Steady-State MSE: {final_stage_ss_mse:.6f}")
     
     # Save the trained model
-    suffix = "_ablate_ctle" if ABLATE_CTLE else ""
-    two_head_suffix = "_two_head" if args.two_head else ""
-    model_path = f"./models/l2o_mlp_model_{args.channel_type}{suffix}{two_head_suffix}_dfe={DFE_TAPS}.pth"
     torch.save(trained_model.state_dict(), model_path)
     print(f"Trained model saved to {model_path}")
     print("-" * 50)
