@@ -20,34 +20,46 @@ from oversampling_utils import choose_best_symbol_phase_per_example, upsample_sy
 
 
 def load_channels_auto(path: str):
-    """Load channel dicts, auto-detecting IR and SNR key names and top-level structure."""
+    """Load channel dicts from generate_synthetic_channels.py output.
+
+    File structure (from generate_synthetic_channels.py):
+        {
+            'meta': {...},
+            'channels': [
+                {'thru': tensor, 'fext': list|None, 'next': list|None,
+                 'physics_valid': bool, 'augmentation_class': str},
+                ...
+            ]
+        }
+
+    Returns list of dicts with keys 'ir' (thru tensor), 'snr' (float).
+    """
     raw = torch.load(path, map_location='cpu', weights_only=False)
 
-    # Top-level may be a list of channels directly, or a dict with 'channels' key
     if isinstance(raw, dict) and 'channels' in raw:
-        channels = list(raw['channels'])
+        channel_list = list(raw['channels'])
+        meta = raw.get('meta', {})
     elif isinstance(raw, (list, tuple)):
-        channels = list(raw)
+        channel_list = list(raw)
+        meta = {}
     elif isinstance(raw, dict):
-        channels = [raw]
+        channel_list = [raw]
+        meta = {}
     else:
         raise ValueError(f"Unknown channel file format: {type(raw)}")
 
-    # Auto-detect key names for IR and SNR within each channel dict
-    IR_KEYS = ['channel_ir', 'h', 'ir', 'impulse_response', 'coeffs']
-    SNR_KEYS = ['snr', 'SNR', 'snr_db', 'noise_snr']
-
-    def _find(d, keys):
-        for k in keys:
-            if k in d:
-                return d[k]
-        raise KeyError(f"None of {keys} found in channel dict. Available keys: {list(d.keys())}")
+    snr_default = meta.get('snr_db', 30.0) if isinstance(meta, dict) else 30.0
 
     out = []
-    for ch in channels:
-        ir = _find(ch, IR_KEYS)
-        snr = _find(ch, SNR_KEYS)
-        out.append({'ir': ir, 'snr': snr})
+    for i, ch in enumerate(channel_list):
+        if 'thru' not in ch:
+            raise KeyError(
+                f"Channel dict at index {i} missing 'thru' key. "
+                f"Available keys: {list(ch.keys())}"
+            )
+        thru = ch['thru']
+        snr = ch.get('snr_db', snr_default)
+        out.append({'ir': thru, 'snr': snr})
     return out
 
 
