@@ -631,7 +631,7 @@ def train_learned_optimizer_rnn_noagc(channel_gen, dfe, ctle, learned_opt, epoch
         decision_buffer = torch.zeros(batch_size, dfe.num_taps)
         ema_error = torch.ones(batch_size, 1)
 
-        effective_seq_len = total_seq_len - common_delay
+        effective_seq_len = total_seq_len - common_delay.item()
         epoch_total_mse = 0
         epoch_ss_mse = 0
         num_steps = 0
