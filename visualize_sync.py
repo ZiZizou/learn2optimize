@@ -65,6 +65,7 @@ def load_channels_auto(path: str):
 
 def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1]."""
+    h = h.to(tx_upsampled.dtype)
     return F.conv1d(
         tx_upsampled.unsqueeze(0).unsqueeze(0),
         h.unsqueeze(0).unsqueeze(0),
