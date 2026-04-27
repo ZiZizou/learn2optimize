@@ -50,6 +50,7 @@ from s4p_inspector import (
     PortMode,
     TransferMode,
     print_inspection_report,
+    print_inspection_report_to_file,
 )
 
 
