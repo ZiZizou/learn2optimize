@@ -1,0 +1,178 @@
+"""
+Visualize per-example sync behavior on S4P-derived channels.
+
+Loads a .pt file of channel data and shows, for 4 random channels:
+  1. Input TX bitstream
+  2. RX after channel convolution (pre-sync)
+  3. RX aligned via choose_best_symbol_phase_per_example (post-sync)
+
+Run: python visualize_sync.py --channel_pt <path_to_channel.pt>
+"""
+
+import argparse
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+import torch.nn.functional as F
+
+from config import OVERSAMPLE_FACTOR, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN
+from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
+
+
+def load_s4p_channels(path: str):
+    """Load S4P channel dicts from a .pt file."""
+    data = torch.load(path, map_location='cpu', weights_only=False)
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, (list, tuple)):
+        return list(data)
+    raise ValueError(f"Unknown format in {path}: {type(data)}")
+
+
+def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1]."""
+    return F.conv1d(
+        tx_upsampled.unsqueeze(0).unsqueeze(0),   # [1, 1, T]
+        h.unsqueeze(0).unsqueeze(0),                # [1, 1, K]
+        padding=0
+    ).squeeze()  # [T + K - 1]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize per-example sync on S4P channels")
+    parser.add_argument("--channel_pt", type=str, required=True,
+                        help="Path to .pt file with channel dictionaries (keys: 'channel_ir', 'snr')")
+    parser.add_argument("--n_channels", type=int, default=4,
+                        help="Number of distinct channels to visualize (default: 4)")
+    parser.add_argument("--seq_len", type=int, default=48,
+                        help="Bitstream length in symbols (default: 48)")
+    parser.add_argument("--seed", type=int, default=7,
+                        help="Random seed (default: 7)")
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    # --- Load ---
+    print(f"Loading: {args.channel_pt}")
+    all_channels = load_s4p_channels(args.channel_pt)
+    print(f"  -> {len(all_channels)} channel(s) available")
+
+    n_ch = min(args.n_channels, len(all_channels))
+    ch_indices = np.random.choice(len(all_channels), n_ch, replace=False).tolist()
+    print(f"  -> Showing channels: {ch_indices}")
+
+    # Batch size equals number of distinct channels
+    B = n_ch
+    seq_len = args.seq_len
+
+    # --- TX bitstream (same for all channels, just for visualization) ---
+    # Use a repeating pattern so alignment is visually obvious
+    base_pattern = torch.tensor([1, -1, 1, 1, -1, -1, 1, -1], dtype=torch.float32)
+    tx_symbols = base_pattern.repeat((B, seq_len // 8 + 1))[:, :seq_len]
+
+    tx_up = upsample_symbols(tx_symbols, OVERSAMPLE_FACTOR)  # [B, T*P]
+    T_up = tx_up.shape[1]
+
+    # --- Build RX: each batch element uses a DIFFERENT channel from the file ---
+    # rx_batch[b] uses channel ch_indices[b]
+    rx_batch = torch.zeros(B, T_up)  # placeholder, real length varies
+
+    for b in range(B):
+        ch = all_channels[ch_indices[b]]
+        h = ch['channel_ir']  # [K]
+        snr_db = ch.get('snr', 30.0)
+
+        raw = convolve_channel(tx_up[b], h)  # [T_up + K - 1]
+
+        # Add channel-specific noise
+        sig_pow = raw.pow(2).mean()
+        noise_std = np.sqrt(sig_pow.item() / (10 ** (snr_db / 10)))
+        rx_b = raw + noise_std * torch.randn_like(raw)
+
+        # Truncate/pad to T_up (all same length for batch)
+        if rx_b.shape[0] >= T_up:
+            rx_batch[b] = rx_b[:T_up]
+        else:
+            rx_batch[b, :rx_b.shape[0]] = rx_b
+
+    print(f"  -> RX batch shape: {rx_batch.shape}")
+
+    # --- Run per-example sync ---
+    best_rx, phase, delay = choose_best_symbol_phase_per_example(
+        tx_symbols,
+        rx_batch,
+        OVERSAMPLE_FACTOR,
+        max_delay=PHASE_SEARCH_MAX_DELAY,
+        sync_len=PHASE_SEARCH_SYNC_LEN,
+        use_normalized_corr=True,
+    )
+
+    # --- Stats ---
+    print(f"\nSync results:")
+    print(f"  channels: {ch_indices}")
+    print(f"  phase:    {phase.tolist()}")
+    print(f"  delay:    {delay.tolist()}")
+    print(f"  delay:    min={delay.min().item()}, median={delay.float().median().item():.1f}, max={delay.max().item()}")
+
+    # --- Plot ---
+    t_sym = np.arange(seq_len)
+
+    fig, axes = plt.subplots(B, 3, figsize=(15, B * 2.8))
+    if B == 1:
+        axes = axes.reshape(1, -1)
+
+    for b in range(B):
+        ch_label = f"ch={ch_indices[b]}"
+
+        # TX
+        axes[b, 0].step(t_sym, tx_symbols[b].numpy(), where='mid', lw=1.5)
+        axes[b, 0].set_ylabel(ch_label, fontsize=9)
+        axes[b, 0].set_ylim(-1.8, 1.8)
+        axes[b, 0].set_xlim(0, seq_len - 1)
+        axes[b, 0].grid(True, alpha=0.3)
+        axes[b, 0].set_title("TX bitstream", fontsize=10)
+
+        # RX pre-sync: downsample oversampled to symbol rate
+        rx_pre = rx_batch[b, ::OVERSAMPLE_FACTOR].numpy()
+        axes[b, 1].step(t_sym, rx_pre[:seq_len], where='mid', lw=1.0, alpha=0.8)
+        axes[b, 1].set_ylim(-1.8, 1.8)
+        axes[b, 1].set_xlim(0, seq_len - 1)
+        axes[b, 1].grid(True, alpha=0.3)
+        axes[b, 1].set_title(
+            f"RX pre-sync  (delay={delay[b].item()}, phase={phase[b].item()})",
+            fontsize=9
+        )
+
+        # RX post-sync
+        axes[b, 2].step(t_sym, best_rx[b].numpy(), where='mid', lw=1.0, color='tab:green')
+        axes[b, 2].set_ylim(-1.8, 1.8)
+        axes[b, 2].set_xlim(0, seq_len - 1)
+        axes[b, 2].grid(True, alpha=0.3)
+        axes[b, 2].set_title("RX post-sync (aligned)", fontsize=10)
+
+        if b < B - 1:
+            for col in range(3):
+                axes[b, col].set_xticklabels([])
+        else:
+            for col in range(3):
+                axes[b, col].set_xlabel("Symbol index", fontsize=8)
+
+    fig.suptitle(
+        f"Per-Example Sync on {n_ch} S4P Channels\n"
+        f"'{args.channel_pt.split('/')[-1]}' | seq={seq_len}, OS={OVERSAMPLE_FACTOR}",
+        fontsize=11
+    )
+    plt.tight_layout()
+    plt.show()
+
+    # --- MSE summary ---
+    print(f"\nAlignment MSE (TX vs RX post-sync, first {seq_len} symbols):")
+    for b in range(B):
+        mse = ((tx_symbols[b] - best_rx[b, :seq_len]).pow(2).mean().item())
+        pre_rms = rx_batch[b, ::OVERSAMPLE_FACTOR][:seq_len].pow(2).mean().item()
+        print(f"  B{b} ({ch_label}): MSE={mse:.4f}  (pre-sync RMS={pre_rms:.4f})")
+
+
+if __name__ == "__main__":
+    main()
