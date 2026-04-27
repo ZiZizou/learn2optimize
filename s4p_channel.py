@@ -42,11 +42,24 @@ class S4pChannelGenerator:
         self.disable_agc = disable_agc
         self.samples_per_symbol = samples_per_symbol
 
-        payload = torch.load(touchstone_file_path, map_location="cpu")
+        payload = torch.load(touchstone_file_path, map_location="cpu", weights_only=False)
+
+        def _to_float32(channel_dict):
+            converted = {}
+            for k, v in channel_dict.items():
+                if k == 'source_dir':
+                    converted[k] = v
+                elif isinstance(v, torch.Tensor):
+                    converted[k] = v.float()
+                elif isinstance(v, list):
+                    converted[k] = [t.float() if isinstance(t, torch.Tensor) else t for t in v]
+                else:
+                    converted[k] = v
+            return converted
 
         if isinstance(payload, dict) and "meta" in payload:
             self.channel_dataset_meta = payload["meta"]
-            self.channel_dataset = payload["channels"]
+            self.channel_dataset = [_to_float32(ch) for ch in payload["channels"]]
 
             dataset_sps = int(self.channel_dataset_meta["samples_per_symbol"])
             if dataset_sps != int(self.samples_per_symbol):
@@ -57,7 +70,7 @@ class S4pChannelGenerator:
                 )
         else:
             self.channel_dataset_meta = None
-            self.channel_dataset = payload
+            self.channel_dataset = [_to_float32(ch) if isinstance(ch, dict) else ch for ch in payload]
             if int(self.samples_per_symbol) != 1:
                 raise ValueError(
                     "Legacy S4P dataset has no metadata. Regenerate the "
