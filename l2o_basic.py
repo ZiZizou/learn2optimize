@@ -755,8 +755,11 @@ if __name__ == "__main__":
     ctle = DifferentiableCTLE(num_taps=CTLE_TAPS)
     dfe = DifferentiableDFE(num_taps=DFE_TAPS)
 
-    if args.no_agc:
-        print("!!! Running in NO-AGC mode !!!")
+    if args.no_agc or (args.channel_ir_norm_mode == "none" and not args.no_agc):
+        if args.no_agc:
+            print("!!! Running in NO-AGC mode (explicit --no_agc) !!!")
+        else:
+            print("!!! Running in NO-AGC mode (auto-selected: channel_ir_norm_mode=none) !!!")
         learned_opt = MultiRateLearnedNLMSNoAGC(
             state_dim=NO_AGC_STATE_DIM,
             hidden_dim=L2O_HIDDEN_DIM,
