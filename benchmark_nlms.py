@@ -14,7 +14,8 @@ from config import (
     RMS_EMA_BETA, BASELINE_MODE,
     OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
 )
-from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
+from oversampling_utils import upsample_symbols
+from sync_utils import SyncConfig, align_rx_to_tx, summarize_sync, cross_correlate_sync_batch_deprecated
 from wireline_channel import WirelineChannelGenerator
 from s4p_channel import S4pChannelGenerator
 from ctle_frequency_utils import apply_frequency_domain_ctle
@@ -478,30 +479,12 @@ def cross_correlate_sync(tx, rx, max_delay=100):
 
 def cross_correlate_sync_batch(tx, rx, max_delay=50, sync_len=None):
     """
+    DEPRECATED: Use align_rx_to_tx from sync_utils instead.
+
     Computes integer sample delay for each element in the batch using
     cross-correlation. This accounts for channel + CTLE group delay.
     """
-    batch_size = tx.shape[0]
-    seq_len = tx.shape[1]
-    delays = []
-
-    # Use up to 200 symbols for sync, but not more than available
-    if sync_len is None:
-        sync_len = min(200, seq_len - max_delay)
-
-    if sync_len <= 0:
-        raise ValueError(f"Sequence length {seq_len} too short for max_delay {max_delay}")
-
-    tx_sync = tx[:, :sync_len]
-    rx_sync = rx[:, :sync_len + max_delay]
-
-    for i in range(batch_size):
-        corrs = []
-        for d in range(max_delay):
-            c = torch.dot(tx_sync[i], rx_sync[i, d:d+sync_len])
-            corrs.append(c.item())
-        delays.append(torch.argmax(torch.abs(torch.tensor(corrs))).item())
-    return delays
+    return cross_correlate_sync_batch_deprecated(tx, rx, max_delay, sync_len)
 
 # ==========================================
 # 5. Benchmark Execution
@@ -580,23 +563,34 @@ if __name__ == "__main__":
         fc=0.25,
     )
 
-    # 3. Phase selection and decimation to symbol rate
-    # Use normalized correlation in no-AGC robust mode for amplitude-invariant sync
-    rx_aligned, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
+    sync_cfg = SyncConfig(
+        oversample_factor=OVERSAMPLE_FACTOR,
+        max_delay_symbols=PHASE_SEARCH_MAX_DELAY,
+        sync_len_symbols=PHASE_SEARCH_SYNC_LEN,
+        metric="normalized",
+        polarity_mode="report",
+    )
+    sync_result = align_rx_to_tx(
         tx,
         rx_ctle,
-        OVERSAMPLE_FACTOR,
-        max_delay=PHASE_SEARCH_MAX_DELAY,
-        sync_len=PHASE_SEARCH_SYNC_LEN,
-        use_normalized_corr=use_normalized_corr,
+        seq_len=tx.shape[1],
+        cfg=sync_cfg,
     )
+    rx_aligned = sync_result.rx_aligned
+    best_phase = sync_result.best_phase
+    delay_per_example = sync_result.best_delay_symbols
     tx_aligned = tx
 
+    sync_stats = summarize_sync(sync_result)
     delay_min = int(delay_per_example.min().item())
     delay_median = int(delay_per_example.float().median().item())
     delay_max = int(delay_per_example.max().item())
     print(f"Oversample factor: {OVERSAMPLE_FACTOR}, Best phase: {best_phase}")
     print(f"Sync delay stats: min={delay_min}, median={delay_median}, max={delay_max}")
+    print(f"Sync diagnostics: score_mean={sync_stats['score_mean']:.3f}, "
+          f"margin_mean={sync_stats['margin_mean']:.3f}, "
+          f"delay_boundary={sync_stats['delay_boundary_frac']:.1%}, "
+          f"neg_polarity={sync_stats['negative_polarity_frac']:.1%}")
     print(f"Aligned sequence length: {tx_aligned.shape[1]}")
     print("-" * 30)
 

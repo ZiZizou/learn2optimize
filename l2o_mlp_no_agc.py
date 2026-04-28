@@ -14,10 +14,8 @@ from config import (
 from wireline_channel import WirelineChannelGenerator
 from utils import add_channel_args, get_channel_generator
 from ctle_frequency_utils import apply_frequency_domain_ctle
-from oversampling_utils import (
-    choose_best_symbol_phase_per_example,
-    upsample_symbols,
-)
+from oversampling_utils import upsample_symbols
+from sync_utils import SyncConfig, align_rx_to_tx, cross_correlate_sync_batch_deprecated
 from feature_normalization import (
     StreamingFeatureNormalizer,
     build_no_agc_state,
@@ -184,14 +182,20 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     )
                 rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
 
-            rx_init, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
+            sync_cfg = SyncConfig(
+                oversample_factor=OVERSAMPLE_FACTOR,
+                max_delay_symbols=PHASE_SEARCH_MAX_DELAY,
+                sync_len_symbols=PHASE_SEARCH_SYNC_LEN,
+                metric="normalized",
+                polarity_mode="report",
+            )
+            sync_result = align_rx_to_tx(
                 tx_symbols,
                 rx_frontend,
-                OVERSAMPLE_FACTOR,
-                max_delay=PHASE_SEARCH_MAX_DELAY,
-                sync_len=PHASE_SEARCH_SYNC_LEN,
-                use_normalized_corr=True,
+                seq_len=tx_symbols.shape[1],
+                cfg=sync_cfg,
             )
+            rx_init = sync_result.rx_aligned
 
         dfe_weights = torch.zeros(batch_size, dfe.num_taps)
 

@@ -11,7 +11,8 @@ from config import (
     ABLATE_CTLE, OVERSAMPLE_FACTOR, OVERSAMPLE_MODE,
     PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
 )
-from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
+from oversampling_utils import upsample_symbols
+from sync_utils import SyncConfig, align_rx_to_tx, cross_correlate_sync_batch_deprecated
 
 # ==========================================
 # MLP-Based Learned Optimizer
@@ -168,30 +169,12 @@ class MultiRateLearnedMLP(nn.Module):
 # ==========================================
 def cross_correlate_sync_batch(tx, rx, max_delay=50, sync_len=None):
     """
+    DEPRECATED: Use align_rx_to_tx from sync_utils instead.
+
     Computes integer sample delay for each element in the batch using
     cross-correlation.
     """
-    batch_size = tx.shape[0]
-    seq_len = tx.shape[1]
-    delays = []
-
-    # Use up to 200 symbols for sync, but not more than available
-    if sync_len is None:
-        sync_len = min(200, seq_len - max_delay)
-
-    if sync_len <= 0:
-        raise ValueError(f"Sequence length {seq_len} too short for max_delay {max_delay}")
-
-    tx_sync = tx[:, :sync_len]
-    rx_sync = rx[:, :sync_len + max_delay]
-
-    for i in range(batch_size):
-        corrs = []
-        for d in range(max_delay):
-            c = torch.dot(tx_sync[i], rx_sync[i, d:d+sync_len])
-            corrs.append(c.item())
-        delays.append(torch.argmax(torch.abs(torch.tensor(corrs))).item())
-    return delays
+    return cross_correlate_sync_batch_deprecated(tx, rx, max_delay, sync_len)
 
 
 def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, batch_size=64,
@@ -234,14 +217,20 @@ def train_learned_optimizer(channel_gen, dfe, ctle, learned_opt, epochs=100, bat
                     )
                 rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * 0.5)
 
-            rx_init, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
+            sync_cfg = SyncConfig(
+                oversample_factor=OVERSAMPLE_FACTOR,
+                max_delay_symbols=PHASE_SEARCH_MAX_DELAY,
+                sync_len_symbols=PHASE_SEARCH_SYNC_LEN,
+                metric="normalized",
+                polarity_mode="report",
+            )
+            sync_result = align_rx_to_tx(
                 tx_symbols,
                 rx_frontend,
-                OVERSAMPLE_FACTOR,
-                max_delay=PHASE_SEARCH_MAX_DELAY,
-                sync_len=PHASE_SEARCH_SYNC_LEN,
-                use_normalized_corr=True,
+                seq_len=tx_symbols.shape[1],
+                cfg=sync_cfg,
             )
+            rx_init = sync_result.rx_aligned
 
         # Initialize DFE weights
         dfe_weights = torch.zeros(batch_size, dfe.num_taps)

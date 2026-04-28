@@ -17,12 +17,9 @@ from config import (
     OVERSAMPLE_FACTOR, OVERSAMPLE_MODE, PHASE_SEARCH_MAX_DELAY, PHASE_SEARCH_SYNC_LEN,
     RMS_EMA_BETA, BASELINE_MODE,
 )
-from oversampling_utils import choose_best_symbol_phase_per_example, upsample_symbols
+from oversampling_utils import upsample_symbols
 
-from benchmark_nlms import run_batch_nlms_dfe, run_batch_rls_dfe, BaselineMode
-from utils import add_channel_args, get_channel_generator
-from ctle_frequency_utils import apply_frequency_domain_ctle
-from l2o_basic import MultiRateLearnedNLMS, DifferentiableCTLE, DifferentiableDFE, cross_correlate_sync_batch
+from sync_utils import SyncConfig, align_rx_to_tx, summarize_sync
 from l2o_mlp import MultiRateLearnedMLP
 from l2o_mlp_no_agc import MultiRateLearnedMLPNoAGC
 
@@ -54,14 +51,22 @@ def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_pe
                 )
             rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-        rx_init, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
+        sync_cfg = SyncConfig(
+            oversample_factor=OVERSAMPLE_FACTOR,
+            max_delay_symbols=PHASE_SEARCH_MAX_DELAY,
+            sync_len_symbols=PHASE_SEARCH_SYNC_LEN,
+            metric="normalized",
+            polarity_mode="report",
+        )
+        sync_result = align_rx_to_tx(
             tx_symbols,
             rx_frontend,
-            OVERSAMPLE_FACTOR,
-            max_delay=PHASE_SEARCH_MAX_DELAY,
-            sync_len=PHASE_SEARCH_SYNC_LEN,
-            use_normalized_corr=True,
+            seq_len=seq_len,
+            cfg=sync_cfg,
         )
+        rx_init = sync_result.rx_aligned
+        best_phase = sync_result.best_phase
+        delay_per_example = sync_result.best_delay_symbols
 
     # Initialize state
     hidden_state = torch.zeros(batch_size, 32) if model_type != "mlp" else None
@@ -349,21 +354,36 @@ if __name__ == "__main__":
             )
         rx_frontend = ctle(rx_base, torch.ones(batch_size, 1) * ctle_peaking)
 
-    rx_aligned, best_phase, delay_per_example = choose_best_symbol_phase_per_example(
+    eval_sync_cfg = SyncConfig(
+        oversample_factor=OVERSAMPLE_FACTOR,
+        max_delay_symbols=PHASE_SEARCH_MAX_DELAY,
+        sync_len_symbols=PHASE_SEARCH_SYNC_LEN,
+        metric="normalized",
+        polarity_mode="report",
+    )
+    eval_sync_result = align_rx_to_tx(
         tx_symbols,
         rx_frontend,
-        OVERSAMPLE_FACTOR,
-        max_delay=PHASE_SEARCH_MAX_DELAY,
-        sync_len=PHASE_SEARCH_SYNC_LEN,
-        use_normalized_corr=use_normalized_corr,
+        seq_len=seq_len,
+        cfg=eval_sync_cfg,
     )
+    rx_aligned = eval_sync_result.rx_aligned
+    best_phase = eval_sync_result.best_phase
+    delay_per_example = eval_sync_result.best_delay_symbols
     tx_aligned = tx_symbols
 
+    sync_stats = summarize_sync(eval_sync_result)
     delay_min = int(delay_per_example.min().item())
     delay_median = int(delay_per_example.float().median().item())
     delay_max = int(delay_per_example.max().item())
     print(f"Batch size: {batch_size}, Oversample factor: {OVERSAMPLE_FACTOR}")
     print(f"Best phase: {best_phase}, Delay stats: min={delay_min}, median={delay_median}, max={delay_max}")
+    print(f"Sync diagnostics: score_mean={sync_stats['score_mean']:.3f}, "
+          f"score_min={sync_stats['score_min']:.3f}, margin_mean={sync_stats['margin_mean']:.3f}, "
+          f"delay_boundary={sync_stats['delay_boundary_frac']:.1%}, "
+          f"phase_boundary={sync_stats['phase_boundary_frac']:.1%}, "
+          f"neg_polarity={sync_stats['negative_polarity_frac']:.1%}, "
+          f"ambiguous={sync_stats['ambiguous_frac']:.1%}")
     print("-" * 60)
 
     results = {}
