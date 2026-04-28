@@ -234,9 +234,8 @@ def _align_oversampled(
     best_score = rho_flat.max(dim=1).values
     margin = best_score - second_best_score
 
-    best_signed_corr = corr_signed.gather(
-        2, best_delay.unsqueeze(-1).unsqueeze(-1).expand(-1, P, -1)
-    ).gather(1, best_phase.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, D_search)).squeeze(-1).squeeze(-1)
+    b_idx = torch.arange(B, device=rx_signal.device)
+    best_signed_corr = corr_signed[b_idx, best_phase, best_delay_clamped]
 
     polarity = torch.sign(best_signed_corr)
     polarity = torch.where(polarity == 0, torch.ones_like(polarity), polarity)
