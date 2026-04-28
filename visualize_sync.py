@@ -64,26 +64,44 @@ def load_channels_auto(path: str):
 
 
 def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-    """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1]."""
+    """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1].
+
+    Uses the same approach as wireline_channel.py and s4p_channel.py:
+    - Pad input for causal convolution
+    - Flip filter (F.conv1d computes cross-correlation)
+    - Use grouped convolution
+    """
     tx = tx_upsampled.flatten().float()
     h_flat = h.flatten().float()
 
-    print(f"      [DEBUG conv] tx.shape={tx.shape}, h_flat.shape={h_flat.shape}")
+    seq_len = tx.shape[0]
+    num_taps = h_flat.shape[0]
 
-    tx_unsqueezed = tx.unsqueeze(0).unsqueeze(0)
-    h_unsqueezed = h_flat.unsqueeze(0).unsqueeze(0)
+    print(f"      [DEBUG conv] tx.shape={tx.shape}, h_flat.shape={h_flat.shape}, seq_len={seq_len}, num_taps={num_taps}")
 
-    print(f"      [DEBUG conv] tx_unsqueezed.shape={tx_unsqueezed.shape}, h_unsqueezed.shape={h_unsqueezed.shape}")
+    # Pad for causal convolution (no look-ahead) - same as wireline_channel.py
+    tx_padded = F.pad(tx, (num_taps - 1, 0))
+    print(f"      [DEBUG conv] tx_padded.shape={tx_padded.shape}")
 
-    h_flipped = torch.flip(h_unsqueezed, dims=[-1])
+    # Reshape for grouped 1D convolution
+    # wireline_channel uses: tx_reshaped = tx_padded.view(1, batch_size, -1)
+    # But we process one channel at a time, so batch_size=1
+    tx_reshaped = tx_padded.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len + num_taps - 1]
+    h_reshaped = h_flat.unsqueeze(0).unsqueeze(0)  # [1, 1, num_taps]
+
+    print(f"      [DEBUG conv] tx_reshaped.shape={tx_reshaped.shape}, h_reshaped.shape={h_reshaped.shape}")
+
+    # Flip filter for true convolution (F.conv1d does cross-correlation)
+    h_flipped = torch.flip(h_reshaped, dims=[-1])
 
     print(f"      [DEBUG conv] h_flipped.shape={h_flipped.shape}")
 
-    result = F.conv1d(tx_unsqueezed, h_flipped, padding=0)
+    # Apply convolution
+    result = F.conv1d(tx_reshaped, h_flipped, padding=0)
     print(f"      [DEBUG conv] result.shape={result.shape}")
 
     squeezed = result.squeeze()
-    print(f"      [DEBUG conv] squeezed.shape={squeezed.shape}, squeezed={squeezed.tolist()[:20] if squeezed.numel() > 20 else squeezed.tolist()}")
+    print(f"      [DEBUG conv] squeezed.shape={squeezed.shape}")
 
     return squeezed
 
