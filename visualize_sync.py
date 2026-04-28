@@ -204,7 +204,7 @@ def main():
     T_rx = rx_batch.shape[1]
     t_pad = ((T_rx + sps - 1) // sps) * sps
     rx_pad = F.pad(rx_batch, (0, t_pad - T_rx))
-    rx_phase = rx_pad.view(B, -1, sps).transpose(1, 2).contiguous()  # [B, sps, seq_len]
+    rx_phase = rx_pad.view(B, -1, sps).transpose(1, 2).contiguous()[:, :, :seq_len]  # [B, sps, seq_len]
 
     # --- Run per-example sync ---
     sync_len = min(PHASE_SEARCH_SYNC_LEN, seq_len)
