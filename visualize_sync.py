@@ -65,14 +65,27 @@ def load_channels_auto(path: str):
 
 def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1]."""
-    tx = tx_upsampled.flatten().to(dtype=torch.float32)
-    h_flat = h.flatten().to(dtype=torch.float32)
-    n_out = tx.shape[0] + h_flat.shape[0] - 1
-    return F.conv1d(
-        tx.view(1, 1, -1),
-        h_flat.view(1, 1, -1),
-        padding=0
-    ).flatten()[:n_out]
+    tx = tx_upsampled.flatten().float()
+    h_flat = h.flatten().float()
+
+    print(f"      [DEBUG conv] tx.shape={tx.shape}, h_flat.shape={h_flat.shape}")
+
+    tx_unsqueezed = tx.unsqueeze(0).unsqueeze(0)
+    h_unsqueezed = h_flat.unsqueeze(0).unsqueeze(0)
+
+    print(f"      [DEBUG conv] tx_unsqueezed.shape={tx_unsqueezed.shape}, h_unsqueezed.shape={h_unsqueezed.shape}")
+
+    h_flipped = torch.flip(h_unsqueezed, dims=[-1])
+
+    print(f"      [DEBUG conv] h_flipped.shape={h_flipped.shape}")
+
+    result = F.conv1d(tx_unsqueezed, h_flipped, padding=0)
+    print(f"      [DEBUG conv] result.shape={result.shape}")
+
+    squeezed = result.squeeze()
+    print(f"      [DEBUG conv] squeezed.shape={squeezed.shape}, squeezed={squeezed.tolist()[:20] if squeezed.numel() > 20 else squeezed.tolist()}")
+
+    return squeezed
 
 
 def main():
@@ -151,6 +164,7 @@ def main():
         print(f"  ch{ch_indices[b]}: IR first 10 values: {h[:10].tolist()}")
 
         raw = convolve_channel(tx_up[b], h)  # [T_up + K - 1]
+        print(f"  ch{ch_indices[b]}: raw conv BEFORE squeeze shape={raw.shape if raw.ndim > 0 else 'scalar'}")
         if raw.ndim == 0:
             raw = raw.unsqueeze(0)
         raw = raw.to(dtype=torch.float32)
