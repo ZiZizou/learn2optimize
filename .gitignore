@@ -49,3 +49,5 @@ processed_802_3ck/*
 PROBLEM_STATEMENT.md
 docs/*
 tests/__pycache__/*
+*.md
+.gitnexus

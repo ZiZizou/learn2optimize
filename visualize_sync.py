@@ -77,33 +77,17 @@ def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tenso
     seq_len = tx.shape[0]
     num_taps = h_flat.shape[0]
 
-    print(f"      [DEBUG conv] tx.shape={tx.shape}, h_flat.shape={h_flat.shape}, seq_len={seq_len}, num_taps={num_taps}")
+    # For causal convolution: output_len = seq_len + num_taps - 1
+    # Approach from wireline_channel.py: pre-pad input, then conv1d with padding=0
+    tx_padded = F.pad(tx, (num_taps - 1, 0))  # Add num_taps-1 zeros to left
 
-    # Pad for causal convolution (no look-ahead) - same as wireline_channel.py
-    tx_padded = F.pad(tx, (num_taps - 1, 0))
-    print(f"      [DEBUG conv] tx_padded.shape={tx_padded.shape}")
-
-    # Reshape for grouped 1D convolution
-    # wireline_channel uses: tx_reshaped = tx_padded.view(1, batch_size, -1)
-    # But we process one channel at a time, so batch_size=1
     tx_reshaped = tx_padded.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len + num_taps - 1]
     h_reshaped = h_flat.unsqueeze(0).unsqueeze(0)  # [1, 1, num_taps]
-
-    print(f"      [DEBUG conv] tx_reshaped.shape={tx_reshaped.shape}, h_reshaped.shape={h_reshaped.shape}")
-
-    # Flip filter for true convolution (F.conv1d does cross-correlation)
     h_flipped = torch.flip(h_reshaped, dims=[-1])
 
-    print(f"      [DEBUG conv] h_flipped.shape={h_flipped.shape}")
-
-    # Apply convolution
     result = F.conv1d(tx_reshaped, h_flipped, padding=0)
-    print(f"      [DEBUG conv] result.shape={result.shape}")
 
-    squeezed = result.squeeze()
-    print(f"      [DEBUG conv] squeezed.shape={squeezed.shape}")
-
-    return squeezed
+    return result.squeeze()
 
 
 def main():
@@ -133,13 +117,26 @@ def main():
     ch_indices = np.random.choice(len(all_channels), n_ch, replace=False).tolist()
     print(f"  -> Showing channels: {ch_indices}")
 
-    # Get oversample factor from the channel file metadata, not config
+    # Get oversample factor and num_taps from the channel file metadata, not config
     raw_meta = torch.load(args.channel_pt, map_location='cpu', weights_only=False)
     channel_meta = raw_meta.get('meta', {}) if isinstance(raw_meta, dict) else {}
+
     sps = channel_meta.get('samples_per_symbol', OVERSAMPLE_FACTOR)
+    num_taps_meta = channel_meta.get('num_taps', None)
     norm_mode = args.channel_norm_mode
-    print(f"  -> Using samples_per_symbol={sps} (from channel file, config default={OVERSAMPLE_FACTOR})")
-    print(f"  -> Channel normalization mode: '{norm_mode}'")
+
+    # Warn if config oversampling disagrees with dataset metadata
+    if sps != OVERSAMPLE_FACTOR:
+        print(f"  WARNING: config OVERSAMPLE_FACTOR={OVERSAMPLE_FACTOR} but dataset samples_per_symbol={sps}. Using dataset metadata.")
+
+    # Fail loudly if metadata is missing (no silent fallback for num_taps)
+    if num_taps_meta is None:
+        raise KeyError(
+            f"Channel file metadata missing 'num_taps'. "
+            f"Available meta keys: {list(channel_meta.keys())}"
+        )
+
+    print(f"  Loaded channel metadata: samples_per_symbol={sps}, num_taps={num_taps_meta}, normalization={norm_mode}")
 
     # Batch size equals number of distinct channels
     B = n_ch
@@ -152,22 +149,16 @@ def main():
 
     print(f"  TX symbols shape={tx_symbols.shape}, values: {tx_symbols[0,:20].tolist()}")
 
-    tx_up = upsample_symbols(tx_symbols, sps)  # [B, T*P]
+    tx_up = upsample_symbols(tx_symbols, sps)  # [B, T_up]
     T_up = tx_up.shape[1]
+    rx_full_len = T_up + num_taps_meta - 1
 
-    # rx_full length = T_up + num_taps - 1 (full convolution output length)
-    num_taps = all_channels[0]['ir'].shape[0]
-    rx_full_len = T_up + num_taps - 1
+    print(f"  TX upsampled length: {T_up}")
+    print(f"  Expected full RX length: {rx_full_len} (T_up + num_taps - 1 = {T_up} + {num_taps_meta} - 1)")
 
-    print(f"  tx_up shape={tx_up.shape}, first 20 values: {tx_up[0,:20].tolist()}")
-    print(f"  Channel IR num_taps={num_taps}, rx_full_len={rx_full_len}")
-
-    # --- Build RX: each batch element uses a DIFFERENT channel from the file ---
-    # rx_batch[b] uses channel ch_indices[b]
+    # rx_batch must be rx_full_len, NOT T_up
     rx_batch = torch.zeros(B, rx_full_len)  # Full convolution output length
 
-    # Auto-gain: If normalization=none, channel IRs have raw small amplitudes.
-    # Peak-normalize them for visualization so signals are visible.
     auto_gain = (norm_mode == 'none')
 
     for b in range(B):
@@ -210,9 +201,20 @@ def main():
 
     print(f"  -> RX batch shape: {rx_batch.shape}, min={rx_batch.min().item():.6f}, max={rx_batch.max().item():.6f}")
 
+    # Hard assertion: verify RX has full convolution length
+    assert rx_batch.shape[1] == rx_full_len, (
+        f"ERROR: RX length is {rx_batch.shape[1]} but expected {rx_full_len}. "
+        f"Full convolution tail is missing."
+    )
+
+    # --- Build phase-aligned pre-sync stream for interpretable comparison ---
+    # rx_phase[b, p, :] = rx_batch[b, p::sps] gives symbol-rate stream at phase p
+    rx_phase = rx_batch.view(B, sps, -1)  # [B, sps, rx_full_len // sps]
+    rx_phase = rx_phase[:, :, :seq_len]    # [B, sps, seq_len]
+
     # --- Run per-example sync ---
     sync_len = min(PHASE_SEARCH_SYNC_LEN, seq_len)
-    best_rx, phase, delay = choose_best_symbol_phase_per_example(
+    best_rx, best_phase, best_delay = choose_best_symbol_phase_per_example(
         tx_symbols,
         rx_batch,
         sps,
@@ -222,21 +224,29 @@ def main():
     )
 
     # --- Stats ---
+    # Warn if all examples returned phase=0 and delay=0 (suspicious sync collapse)
+    all_zero = (best_phase == 0).all() and (best_delay == 0).all()
+    if all_zero:
+        print(f"\n  WARNING: all examples returned phase=0 and delay=0. "
+              f"This often indicates truncated RX or wrong oversample factor.")
+
     print(f"\nSync results:")
-    print(f"  channels: {ch_indices}")
-    print(f"  phase:    {phase.tolist()}")
-    print(f"  delay:    {delay.tolist()}")
-    print(f"  delay:    min={delay.min().item()}, median={delay.float().median().item():.1f}, max={delay.max().item()}")
+    for b in range(B):
+        ch_id = ch_indices[b]
+        mse_post = ((best_rx[b, :seq_len] - tx_symbols[b, :seq_len]) ** 2).mean().item()
+        print(f"  ch={ch_id}  phase={best_phase[b].item()}  delay={best_delay[b].item()}  mse={mse_post:.4f}")
 
     # --- Plot ---
     t_sym = np.arange(seq_len)
 
-    fig, axes = plt.subplots(B, 3, figsize=(15, B * 2.8))
+    fig, axes = plt.subplots(B, 4, figsize=(20, B * 2.8))
     if B == 1:
         axes = axes.reshape(1, -1)
 
     for b in range(B):
         ch_label = f"ch={ch_indices[b]}"
+        bp = best_phase[b].item()
+        bd = best_delay[b].item()
 
         # TX
         axes[b, 0].step(t_sym, tx_symbols[b].numpy(), where='mid', lw=1.5)
@@ -246,45 +256,55 @@ def main():
         axes[b, 0].grid(True, alpha=0.3)
         axes[b, 0].set_title("TX bitstream", fontsize=10)
 
-        # RX pre-sync: downsample oversampled to symbol rate
-        rx_pre = rx_batch[b, ::sps].numpy()
-        axes[b, 1].step(t_sym, rx_pre[:seq_len], where='mid', lw=1.0, alpha=0.8)
+        # RX pre-sync: use best_phase[b] for phase, but start at delay=0
+        # This shows the same phase as post-sync but WITHOUT delay correction applied
+        # so the viewer can see what delay correction removes
+        rx_pre_sync = rx_phase[b, bp, :].numpy()  # [seq_len], phase-selected, no delay shift
+        axes[b, 1].step(t_sym, rx_pre_sync, where='mid', lw=1.0, alpha=0.8)
         axes[b, 1].set_ylim(-1.8, 1.8)
         axes[b, 1].set_xlim(0, seq_len - 1)
         axes[b, 1].grid(True, alpha=0.3)
-        axes[b, 1].set_title(
-            f"RX pre-sync  (delay={delay[b].item()}, phase={phase[b].item()})",
-            fontsize=9
-        )
+        axes[b, 1].set_title(f"RX pre-sync  (phase={bp}, delay={bd} to fix)", fontsize=9)
 
-        # RX post-sync
+        # RX post-sync (already aligned by choose_best_symbol_phase_per_example)
         axes[b, 2].step(t_sym, best_rx[b].numpy(), where='mid', lw=1.0, color='tab:green')
         axes[b, 2].set_ylim(-1.8, 1.8)
         axes[b, 2].set_xlim(0, seq_len - 1)
         axes[b, 2].grid(True, alpha=0.3)
         axes[b, 2].set_title("RX post-sync (aligned)", fontsize=10)
 
+        # Raw oversampled RX (shows channel ISI shape)
+        raw_idx = np.arange(rx_full_len)
+        axes[b, 3].plot(raw_idx, rx_batch[b].numpy(), lw=0.5, alpha=0.7)
+        axes[b, 3].set_xlim(0, min(rx_full_len, 300))
+        axes[b, 3].grid(True, alpha=0.3)
+        axes[b, 3].set_title("RX oversampled (first 300 samples)", fontsize=9)
+
         if b < B - 1:
-            for col in range(3):
+            for col in range(4):
                 axes[b, col].set_xticklabels([])
         else:
-            for col in range(3):
-                axes[b, col].set_xlabel("Symbol index", fontsize=8)
+            for col in range(4):
+                axes[b, col].set_xlabel("Symbol index / Sample index", fontsize=8)
 
     fig.suptitle(
         f"Per-Example Sync on {n_ch} S4P Channels\n"
-        f"'{args.channel_pt.split('/')[-1]}' | seq={seq_len}, OS={sps}",
+        f"'{args.channel_pt.split('/')[-1]}' | seq={seq_len}, sps={sps}, num_taps={num_taps_meta}",
         fontsize=11
     )
     plt.tight_layout()
     plt.show()
 
     # --- MSE summary ---
-    print(f"\nAlignment MSE (TX vs RX post-sync, first {seq_len} symbols):")
+    K = min(seq_len, 250)
+    print(f"\nAlignment quality (first {K} symbols):")
     for b in range(B):
-        mse = ((tx_symbols[b] - best_rx[b, :seq_len]).pow(2).mean().item())
-        pre_rms = rx_batch[b, ::sps][:seq_len].pow(2).mean().item()
-        print(f"  B{b} ({ch_label}): MSE={mse:.4f}  (pre-sync RMS={pre_rms:.4f})")
+        ch_id = ch_indices[b]
+        mse_post = ((best_rx[b, :K] - tx_symbols[b, :K]) ** 2).mean().item()
+        rx_pre_dec = rx_phase[b, best_phase[b].item(), :K]
+        mse_pre = ((rx_pre_dec - tx_symbols[b, :K]) ** 2).mean().item()
+        sign_agree = ((best_rx[b, :K].sign() == tx_symbols[b, :K].sign()).float().mean().item())
+        print(f"  ch={ch_id}: pre_mse={mse_pre:.4f}  post_mse={mse_post:.4f}  sign_agree={sign_agree:.3f}")
 
 
 if __name__ == "__main__":
