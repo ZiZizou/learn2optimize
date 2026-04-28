@@ -85,6 +85,9 @@ def main():
                         help="Bitstream length in symbols (default: 48)")
     parser.add_argument("--seed", type=int, default=7,
                         help="Random seed (default: 7)")
+    parser.add_argument("--channel_norm_mode", type=str, default="peak",
+                        choices=["none", "peak"],
+                        help="Channel IR normalization mode: 'none' for raw amplitude (use with normalization=none channels), 'peak' to peak-normalize IRs for display (default: peak)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -103,7 +106,9 @@ def main():
     raw_meta = torch.load(args.channel_pt, map_location='cpu', weights_only=False)
     channel_meta = raw_meta.get('meta', {}) if isinstance(raw_meta, dict) else {}
     sps = channel_meta.get('samples_per_symbol', OVERSAMPLE_FACTOR)
+    norm_mode = args.channel_norm_mode
     print(f"  -> Using samples_per_symbol={sps} (from channel file, config default={OVERSAMPLE_FACTOR})")
+    print(f"  -> Channel normalization mode: '{norm_mode}'")
 
     # Batch size equals number of distinct channels
     B = n_ch
@@ -114,33 +119,59 @@ def main():
     base_pattern = torch.tensor([1, -1, 1, 1, -1, -1, 1, -1], dtype=torch.float32)
     tx_symbols = base_pattern.repeat((B, seq_len // 8 + 1))[:, :seq_len]
 
+    print(f"  TX symbols shape={tx_symbols.shape}, values: {tx_symbols[0,:20].tolist()}")
+
     tx_up = upsample_symbols(tx_symbols, sps)  # [B, T*P]
     T_up = tx_up.shape[1]
+
+    print(f"  tx_up shape={tx_up.shape}, first 20 values: {tx_up[0,:20].tolist()}")
 
     # --- Build RX: each batch element uses a DIFFERENT channel from the file ---
     # rx_batch[b] uses channel ch_indices[b]
     rx_batch = torch.zeros(B, T_up)  # placeholder, real length varies
 
+    # Auto-gain: If normalization=none, channel IRs have raw small amplitudes.
+    # Peak-normalize them for visualization so signals are visible.
+    auto_gain = (norm_mode == 'none')
+
     for b in range(B):
         ch = all_channels[ch_indices[b]]
         h = ch['ir']  # [K]
+
+        if auto_gain:
+            peak = h.abs().max()
+            if peak > 0:
+                h = h / peak
+
         snr_db = ch['snr']
+
+        h_abs_max = h.abs().max().item()
+        h_norm = h.norm().item()
+        print(f"  ch{ch_indices[b]}: IR shape={h.shape}, IR abs_max={h_abs_max:.8f}, IR L2={h_norm:.8f}, IR dtype={h.dtype}")
+        print(f"  ch{ch_indices[b]}: IR first 10 values: {h[:10].tolist()}")
 
         raw = convolve_channel(tx_up[b], h)  # [T_up + K - 1]
         if raw.ndim == 0:
             raw = raw.unsqueeze(0)
         raw = raw.to(dtype=torch.float32)
 
+        raw_abs_max = raw.abs().max().item()
+        print(f"  ch{ch_indices[b]}: raw conv shape={raw.shape}, abs_max={raw_abs_max:.8f}")
+
         # Add channel-specific noise
         sig_pow = raw.pow(2).mean()
         noise_std = np.sqrt(sig_pow.item() / (10 ** (snr_db / 10)))
         rx_b = raw + noise_std * torch.randn_like(raw)
+
+        print(f"  ch{ch_indices[b]}: sig_pow={sig_pow.item():.8f}, noise_std={noise_std:.6f}")
 
         # Truncate/pad to T_up (all same length for batch)
         if rx_b.shape[0] >= T_up:
             rx_batch[b] = rx_b[:T_up]
         else:
             rx_batch[b, :rx_b.shape[0]] = rx_b
+
+        print(f"  ch{ch_indices[b]}: rx_batch[{b}] max={rx_batch[b].abs().max().item():.6f}, rx_batch[{b}, ::sps] max={rx_batch[b, ::sps].abs().max().item():.6f}")
 
     print(f"  -> RX batch shape: {rx_batch.shape}, min={rx_batch.min().item():.6f}, max={rx_batch.max().item():.6f}")
 
