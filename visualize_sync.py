@@ -155,11 +155,16 @@ def main():
     tx_up = upsample_symbols(tx_symbols, sps)  # [B, T*P]
     T_up = tx_up.shape[1]
 
+    # rx_full length = T_up + num_taps - 1 (full convolution output length)
+    num_taps = all_channels[0]['ir'].shape[0]
+    rx_full_len = T_up + num_taps - 1
+
     print(f"  tx_up shape={tx_up.shape}, first 20 values: {tx_up[0,:20].tolist()}")
+    print(f"  Channel IR num_taps={num_taps}, rx_full_len={rx_full_len}")
 
     # --- Build RX: each batch element uses a DIFFERENT channel from the file ---
     # rx_batch[b] uses channel ch_indices[b]
-    rx_batch = torch.zeros(B, T_up)  # placeholder, real length varies
+    rx_batch = torch.zeros(B, rx_full_len)  # Full convolution output length
 
     # Auto-gain: If normalization=none, channel IRs have raw small amplitudes.
     # Peak-normalize them for visualization so signals are visible.
@@ -197,11 +202,9 @@ def main():
 
         print(f"  ch{ch_indices[b]}: sig_pow={sig_pow.item():.8f}, noise_std={noise_std:.6f}")
 
-        # Truncate/pad to T_up (all same length for batch)
-        if rx_b.shape[0] >= T_up:
-            rx_batch[b] = rx_b[:T_up]
-        else:
-            rx_batch[b, :rx_b.shape[0]] = rx_b
+        # rx_b length is T_up + num_taps - 1 = rx_full_len
+        # Store in rx_batch without truncation (keep full signal for sync)
+        rx_batch[b] = rx_b[:rx_full_len]
 
         print(f"  ch{ch_indices[b]}: rx_batch[{b}] max={rx_batch[b].abs().max().item():.6f}, rx_batch[{b}, ::sps] max={rx_batch[b, ::sps].abs().max().item():.6f}")
 
