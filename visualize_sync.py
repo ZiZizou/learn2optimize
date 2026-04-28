@@ -65,12 +65,14 @@ def load_channels_auto(path: str):
 
 def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1]."""
-    h = h.to(tx_upsampled.dtype)
+    tx = tx_upsampled.flatten().to(dtype=torch.float32)
+    h_flat = h.flatten().to(dtype=torch.float32)
+    n_out = tx.shape[0] + h_flat.shape[0] - 1
     return F.conv1d(
-        tx_upsampled.unsqueeze(0).unsqueeze(0),
-        h.unsqueeze(0).unsqueeze(0),
+        tx.view(1, 1, -1),
+        h_flat.view(1, 1, -1),
         padding=0
-    ).squeeze()
+    ).flatten()[:n_out]
 
 
 def main():
@@ -97,6 +99,12 @@ def main():
     ch_indices = np.random.choice(len(all_channels), n_ch, replace=False).tolist()
     print(f"  -> Showing channels: {ch_indices}")
 
+    # Get oversample factor from the channel file metadata, not config
+    raw_meta = torch.load(args.channel_pt, map_location='cpu', weights_only=False)
+    channel_meta = raw_meta.get('meta', {}) if isinstance(raw_meta, dict) else {}
+    sps = channel_meta.get('samples_per_symbol', OVERSAMPLE_FACTOR)
+    print(f"  -> Using samples_per_symbol={sps} (from channel file, config default={OVERSAMPLE_FACTOR})")
+
     # Batch size equals number of distinct channels
     B = n_ch
     seq_len = args.seq_len
@@ -106,7 +114,7 @@ def main():
     base_pattern = torch.tensor([1, -1, 1, 1, -1, -1, 1, -1], dtype=torch.float32)
     tx_symbols = base_pattern.repeat((B, seq_len // 8 + 1))[:, :seq_len]
 
-    tx_up = upsample_symbols(tx_symbols, OVERSAMPLE_FACTOR)  # [B, T*P]
+    tx_up = upsample_symbols(tx_symbols, sps)  # [B, T*P]
     T_up = tx_up.shape[1]
 
     # --- Build RX: each batch element uses a DIFFERENT channel from the file ---
@@ -121,7 +129,7 @@ def main():
         raw = convolve_channel(tx_up[b], h)  # [T_up + K - 1]
         if raw.ndim == 0:
             raw = raw.unsqueeze(0)
-        raw = raw.to(torch.float32)
+        raw = raw.to(dtype=torch.float32)
 
         # Add channel-specific noise
         sig_pow = raw.pow(2).mean()
@@ -134,14 +142,14 @@ def main():
         else:
             rx_batch[b, :rx_b.shape[0]] = rx_b
 
-    print(f"  -> RX batch shape: {rx_batch.shape}")
+    print(f"  -> RX batch shape: {rx_batch.shape}, min={rx_batch.min().item():.6f}, max={rx_batch.max().item():.6f}")
 
     # --- Run per-example sync ---
     sync_len = min(PHASE_SEARCH_SYNC_LEN, seq_len)
     best_rx, phase, delay = choose_best_symbol_phase_per_example(
         tx_symbols,
         rx_batch,
-        OVERSAMPLE_FACTOR,
+        sps,
         max_delay=PHASE_SEARCH_MAX_DELAY,
         sync_len=sync_len,
         use_normalized_corr=True,
@@ -173,7 +181,7 @@ def main():
         axes[b, 0].set_title("TX bitstream", fontsize=10)
 
         # RX pre-sync: downsample oversampled to symbol rate
-        rx_pre = rx_batch[b, ::OVERSAMPLE_FACTOR].numpy()
+        rx_pre = rx_batch[b, ::sps].numpy()
         axes[b, 1].step(t_sym, rx_pre[:seq_len], where='mid', lw=1.0, alpha=0.8)
         axes[b, 1].set_ylim(-1.8, 1.8)
         axes[b, 1].set_xlim(0, seq_len - 1)
@@ -199,7 +207,7 @@ def main():
 
     fig.suptitle(
         f"Per-Example Sync on {n_ch} S4P Channels\n"
-        f"'{args.channel_pt.split('/')[-1]}' | seq={seq_len}, OS={OVERSAMPLE_FACTOR}",
+        f"'{args.channel_pt.split('/')[-1]}' | seq={seq_len}, OS={sps}",
         fontsize=11
     )
     plt.tight_layout()
@@ -209,7 +217,7 @@ def main():
     print(f"\nAlignment MSE (TX vs RX post-sync, first {seq_len} symbols):")
     for b in range(B):
         mse = ((tx_symbols[b] - best_rx[b, :seq_len]).pow(2).mean().item())
-        pre_rms = rx_batch[b, ::OVERSAMPLE_FACTOR][:seq_len].pow(2).mean().item()
+        pre_rms = rx_batch[b, ::sps][:seq_len].pow(2).mean().item()
         print(f"  B{b} ({ch_label}): MSE={mse:.4f}  (pre-sync RMS={pre_rms:.4f})")
 
 
