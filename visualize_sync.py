@@ -64,30 +64,27 @@ def load_channels_auto(path: str):
 
 
 def convolve_channel(tx_upsampled: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-    """Convolve tx [seq] with channel IR h [K] -> [seq + K - 1].
+    """Compute full linear convolution of upsampled TX with channel IR.
 
-    Uses the same approach as wireline_channel.py and s4p_channel.py:
-    - Pad input for causal convolution
-    - Flip filter (F.conv1d computes cross-correlation)
-    - Use grouped convolution
+    Returns y of length T_up + K - 1, preserving the entire convolution tail
+    so the sync function can search over delayed energy from long channels.
     """
     tx = tx_upsampled.flatten().float()
     h_flat = h.flatten().float()
+    K = h_flat.numel()
 
-    seq_len = tx.shape[0]
-    num_taps = h_flat.shape[0]
+    h_flip = torch.flip(h_flat, dims=[0])
+    y = F.conv1d(
+        tx[None, None, :],
+        h_flip[None, None, :],
+        padding=K - 1,
+    ).squeeze()
 
-    # For causal convolution: output_len = seq_len + num_taps - 1
-    # Approach from wireline_channel.py: pre-pad input, then conv1d with padding=0
-    tx_padded = F.pad(tx, (num_taps - 1, 0))  # Add num_taps-1 zeros to left
-
-    tx_reshaped = tx_padded.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len + num_taps - 1]
-    h_reshaped = h_flat.unsqueeze(0).unsqueeze(0)  # [1, 1, num_taps]
-    h_flipped = torch.flip(h_reshaped, dims=[-1])
-
-    result = F.conv1d(tx_reshaped, h_flipped, padding=0)
-
-    return result.squeeze()
+    expected_len = tx.numel() + K - 1
+    assert y.numel() == expected_len, (
+        f"convolve_channel output len {y.numel()} != expected {expected_len}"
+    )
+    return y
 
 
 def main():
@@ -164,6 +161,12 @@ def main():
     for b in range(B):
         ch = all_channels[ch_indices[b]]
         h = ch['ir']  # [K]
+        ch_id = ch_indices[b]
+
+        assert h.numel() == num_taps_meta, (
+            f"Metadata num_taps={num_taps_meta}, but channel {ch_id} has "
+            f"IR length {h.numel()}"
+        )
 
         if auto_gain:
             peak = h.abs().max()
@@ -172,34 +175,22 @@ def main():
 
         snr_db = ch['snr']
 
-        h_abs_max = h.abs().max().item()
-        h_norm = h.norm().item()
-        print(f"  ch{ch_indices[b]}: IR shape={h.shape}, IR abs_max={h_abs_max:.8f}, IR L2={h_norm:.8f}, IR dtype={h.dtype}")
-        print(f"  ch{ch_indices[b]}: IR first 10 values: {h[:10].tolist()}")
+        T_tx = tx_up[b].numel()
+        raw = convolve_channel(tx_up[b], h)
+        assert raw.numel() == T_tx + num_taps_meta - 1, (
+            f"ch{ch_id}: expected conv len {T_tx + num_taps_meta - 1}, got {raw.numel()}"
+        )
 
-        raw = convolve_channel(tx_up[b], h)  # [T_up + K - 1]
-        print(f"  ch{ch_indices[b]}: raw conv BEFORE squeeze shape={raw.shape if raw.ndim > 0 else 'scalar'}")
-        if raw.ndim == 0:
-            raw = raw.unsqueeze(0)
-        raw = raw.to(dtype=torch.float32)
+        print(f"  ch{ch_id}: tx_up_len={T_tx}, ir_len={h.numel()}, "
+              f"expected_full_len={T_tx + h.numel() - 1}, actual_full_len={raw.numel()}")
 
-        raw_abs_max = raw.abs().max().item()
-        print(f"  ch{ch_indices[b]}: raw conv shape={raw.shape}, abs_max={raw_abs_max:.8f}")
+        raw = raw.float()
 
-        # Add channel-specific noise
         sig_pow = raw.pow(2).mean()
         noise_std = np.sqrt(sig_pow.item() / (10 ** (snr_db / 10)))
         rx_b = raw + noise_std * torch.randn_like(raw)
 
-        print(f"  ch{ch_indices[b]}: sig_pow={sig_pow.item():.8f}, noise_std={noise_std:.6f}")
-
-        # rx_b length is T_up + num_taps - 1 = rx_full_len
-        # Store in rx_batch without truncation (keep full signal for sync)
         rx_batch[b] = rx_b[:rx_full_len]
-
-        print(f"  ch{ch_indices[b]}: rx_batch[{b}] max={rx_batch[b].abs().max().item():.6f}, rx_batch[{b}, ::sps] max={rx_batch[b, ::sps].abs().max().item():.6f}")
-
-    print(f"  -> RX batch shape: {rx_batch.shape}, min={rx_batch.min().item():.6f}, max={rx_batch.max().item():.6f}")
 
     # Hard assertion: verify RX has full convolution length
     assert rx_batch.shape[1] == rx_full_len, (
@@ -208,9 +199,12 @@ def main():
     )
 
     # --- Build phase-aligned pre-sync stream for interpretable comparison ---
-    # rx_phase[b, p, :] = rx_batch[b, p::sps] gives symbol-rate stream at phase p
-    rx_phase = rx_batch.view(B, sps, -1)  # [B, sps, rx_full_len // sps]
-    rx_phase = rx_phase[:, :, :seq_len]    # [B, sps, seq_len]
+    # Match the phase packing used by choose_best_symbol_phase_per_example_vectorized:
+    # pad to multiple of sps, then view(B, -1, sps) and transpose to get rx_phase[b, p, :]
+    T_rx = rx_batch.shape[1]
+    t_pad = ((T_rx + sps - 1) // sps) * sps
+    rx_pad = F.pad(rx_batch, (0, t_pad - T_rx))
+    rx_phase = rx_pad.view(B, -1, sps).transpose(1, 2).contiguous()  # [B, sps, seq_len]
 
     # --- Run per-example sync ---
     sync_len = min(PHASE_SEARCH_SYNC_LEN, seq_len)
@@ -223,8 +217,13 @@ def main():
         use_normalized_corr=True,
     )
 
+    print(f"\nSync input shapes:")
+    print(f"  tx_symbols: {tx_symbols.shape}")
+    print(f"  rx_oversampled: {rx_batch.shape}")
+    print(f"  oversample_factor: {sps}")
+    print(f"  sync_len: {sync_len}")
+
     # --- Stats ---
-    # Warn if all examples returned phase=0 and delay=0 (suspicious sync collapse)
     all_zero = (best_phase == 0).all() and (best_delay == 0).all()
     if all_zero:
         print(f"\n  WARNING: all examples returned phase=0 and delay=0. "
