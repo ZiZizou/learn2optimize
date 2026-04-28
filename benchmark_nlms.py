@@ -48,7 +48,8 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
                  use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
                  vss_momentum=0.0, use_soft_decision=True, tau=0.1,
                  baseline_mode=BaselineMode.STANDARD, mu_ffe=None, mu_dfe=None,
-                 rms_floor=NLMS_RMS_FLOOR, ema_beta=RMS_EMA_BETA):
+                 rms_floor=NLMS_RMS_FLOOR, ema_beta=RMS_EMA_BETA,
+                 calibration_stats=None):
     """
     NLMS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -68,11 +69,12 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
                       Typical values: 0.9 or 0.95 for momentum-enabled updates
         use_soft_decision: If True, use tanh(eq_out/tau) soft decisions; if False, use hard sign decisions
         tau: Soft decision temperature parameter (default: 0.1)
-        baseline_mode: STANDARD (vanilla NLMS) or NO_AGC_ROBUST (causal RMS-normalized FFE)
-        mu_ffe: FFE step size (no-AGC robust mode, default=NLMS_MU_FFE)
-        mu_dfe: DFE step size (no-AGC robust mode, default=NLMS_MU_DFE)
+        baseline_mode: STANDARD, NO_AGC_ROBUST, or CALIBRATED (cheating upper bound)
+        mu_ffe: FFE step size (no-AGC robust or calibrated mode, default=NLMS_MU_FFE)
+        mu_dfe: DFE step size (no-AGC robust or calibrated mode, default=NLMS_MU_DFE)
         rms_floor: Minimum RMS value for causal normalization (no-AGC robust mode)
         ema_beta: EMA decay for RMS normalization (no-AGC robust mode)
+        calibration_stats: dict with 'ffe_rms_cal' [B, 1] tensor, required for CALIBRATED mode
     """
     seq_len = rx_signal.shape[0]
     weights = torch.zeros(num_taps, dtype=torch.float32)
@@ -90,10 +92,22 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
     dfe_momentum_buffer = torch.zeros(num_taps, dtype=torch.float32)
     ffe_momentum_buffer = torch.zeros(FFE_TAPS, dtype=torch.float32)
 
+    is_standard = (baseline_mode == BaselineMode.STANDARD)
     is_robust = (baseline_mode == BaselineMode.NO_AGC_ROBUST)
+    is_calibrated = (baseline_mode == BaselineMode.CALIBRATED)
     use_efe_ffe = mu_ffe if mu_ffe is not None else NLMS_MU_FFE
     use_efe_dfe = mu_dfe if mu_dfe is not None else NLMS_MU_DFE
     ema_rms_sq = None
+
+    if is_calibrated and calibration_stats is None:
+        raise ValueError(
+            "CALIBRATED mode requires calibration_stats with 'ffe_rms_cal' [B, 1] tensor"
+        )
+    ffe_rms_cal = None
+    if is_calibrated and calibration_stats is not None:
+        ffe_rms_cal = calibration_stats.get("ffe_rms_cal")
+        if ffe_rms_cal is None:
+            raise ValueError("calibration_stats must contain 'ffe_rms_cal' key")
 
     if use_vss:
         current_mu = vss_mu_max
@@ -123,7 +137,12 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
                 current_mu = (vss_alpha * current_mu) + (vss_gamma * (e_t.item() ** 2))
                 current_mu = max(vss_mu_min, min(vss_mu_max, current_mu))
 
-            if is_robust:
+            if is_calibrated:
+                ffe_dir = ffe_buffer / ffe_rms_cal.clamp_min(rms_floor)
+                dfe_dir = decision_buffer
+                inst_grad_ffe = use_efe_ffe * e_t * ffe_dir
+                inst_grad_dfe = use_efe_dfe * e_t * dfe_dir
+            elif is_robust:
                 ffe_rms_sq = ffe_buffer.pow(2).mean() + eps
                 ffe_dir = ffe_buffer / torch.sqrt(ffe_rms_sq).clamp_min(rms_floor)
                 dfe_dir = decision_buffer
@@ -240,7 +259,7 @@ def run_nlms_dfe(rx_signal, tx_symbols, num_taps, mu=0.1, eps=1e-6, teacher_forc
 def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_forcing=True,
                 use_soft_decision=True, tau=0.1, baseline_mode=BaselineMode.STANDARD,
                 diagonal_loading=RLS_DIAGONAL_LOADING, rms_floor=NLMS_RMS_FLOOR,
-                mu_ffe=None, mu_dfe=None):
+                mu_ffe=None, mu_dfe=None, calibration_stats=None):
     """
     RLS DFE with integrated Multi-Tap FFE (Feed-Forward Equalizer).
 
@@ -255,11 +274,12 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
     Parameters:
         use_soft_decision: If True, use tanh(eq_out/tau) soft decisions; if False, use hard sign decisions
         tau: Soft decision temperature parameter (default: 0.1)
-        baseline_mode: STANDARD (vanilla RLS) or NO_AGC_ROBUST (causal RMS-normalized with diagonal loading)
-        diagonal_loading: Added to P diagonal for numerical stability (no-AGC robust mode)
-        rms_floor: Minimum RMS value for causal normalization (no-AGC robust mode)
-        mu_ffe: FFE step size override (no-AGC robust mode, default=None uses full RLS gain)
-        mu_dfe: DFE step size override (no-AGC robust mode, default=None uses full RLS gain)
+        baseline_mode: STANDARD, NO_AGC_ROBUST, or CALIBRATED (non-causal upper bound)
+        diagonal_loading: Added to P diagonal for numerical stability
+        rms_floor: Minimum RMS value for causal normalization
+        mu_ffe: FFE step size override (no-AGC robust or calibrated mode)
+        mu_dfe: DFE step size override (no-AGC robust or calibrated mode)
+        calibration_stats: dict with 'ffe_rms_cal', required for CALIBRATED mode
     """
     seq_len = rx_signal.shape[0]
     system_order = FFE_TAPS + num_taps
@@ -277,8 +297,19 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
     target_log = []
 
     is_robust = (baseline_mode == BaselineMode.NO_AGC_ROBUST)
+    is_calibrated = (baseline_mode == BaselineMode.CALIBRATED)
     use_efe_ffe = mu_ffe if mu_ffe is not None else 1.0
     use_efe_dfe = mu_dfe if mu_dfe is not None else 1.0
+
+    if is_calibrated and calibration_stats is None:
+        raise ValueError(
+            "CALIBRATED mode requires calibration_stats with 'ffe_rms_cal' scalar"
+        )
+    ffe_rms_cal = None
+    if is_calibrated and calibration_stats is not None:
+        ffe_rms_cal = calibration_stats.get("ffe_rms_cal")
+        if ffe_rms_cal is None:
+            raise ValueError("calibration_stats must contain 'ffe_rms_cal' key")
 
     for t in range(seq_len):
         ffe_buffer = torch.roll(ffe_buffer, shifts=1, dims=0)
@@ -286,7 +317,10 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
 
         target_idx = t - FFE_MAIN_CURSOR
 
-        if is_robust:
+        if is_calibrated:
+            ffe_dir = ffe_buffer / max(ffe_rms_cal, rms_floor)
+            u_t = torch.cat([ffe_dir, -decision_buffer]).unsqueeze(1)
+        elif is_robust:
             ffe_rms_sq = ffe_buffer.pow(2).mean() + 1e-6
             ffe_dir = ffe_buffer / torch.sqrt(ffe_rms_sq).clamp_min(rms_floor)
             u_t = torch.cat([ffe_dir, -decision_buffer]).unsqueeze(1)
@@ -310,7 +344,12 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
             denom = lam + u_P_u.squeeze()
             k_t = P_u / denom
 
-            if is_robust:
+            if is_calibrated:
+                k_fffe = k_t[:FFE_TAPS] * use_efe_ffe
+                k_dfef = k_t[FFE_TAPS:] * use_efe_dfe
+                k_t_scaled = torch.cat([k_fffe, k_dfef])
+                weights = weights + (k_t_scaled.squeeze() * e_t)
+            elif is_robust:
                 k_fffe = k_t[:FFE_TAPS] * use_efe_ffe
                 k_dfef = k_t[FFE_TAPS:] * use_efe_dfe
                 k_t_scaled = torch.cat([k_fffe, k_dfef])
@@ -321,7 +360,9 @@ def run_rls_dfe(rx_signal, tx_symbols, num_taps, lam=0.99, delta=0.01, teacher_f
             k_u_t = torch.matmul(k_t, u_t.t())
             P = (P - torch.matmul(k_u_t, P)) / lam
 
-            if is_robust and diagonal_loading > 0:
+            if is_calibrated and diagonal_loading > 0:
+                P = P + diagonal_loading * torch.eye(system_order, dtype=torch.float32)
+            elif is_robust and diagonal_loading > 0:
                 P = P + diagonal_loading * torch.eye(system_order, dtype=torch.float32)
 
             decision = torch.tanh(eq_out / tau) if use_soft_decision else (torch.sign(eq_out) if eq_out != 0 else 1.0)
@@ -352,7 +393,8 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
                        use_vss=False, vss_mu_max=0.1, vss_mu_min=0.005, vss_alpha=0.99, vss_gamma=1e-3,
                        vss_momentum=0.0, use_soft_decision=True, tau=0.1,
                        baseline_mode=BaselineMode.STANDARD, mu_ffe=None, mu_dfe=None,
-                       rms_floor=NLMS_RMS_FLOOR, ema_beta=RMS_EMA_BETA):
+                       rms_floor=NLMS_RMS_FLOOR, ema_beta=RMS_EMA_BETA,
+                       calibration_stats=None):
     """
     Wrapper to run NLMS DFE over a batch of channels.
 
@@ -367,9 +409,10 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
         avg_mu_history: Averaged step size across batch dimension [seq_len] (for VSS)
 
     Parameters:
-        baseline_mode: STANDARD or NO_AGC_ROBUST
-        mu_ffe, mu_dfe: Separate step sizes (no-AGC robust mode)
+        baseline_mode: STANDARD, NO_AGC_ROBUST, or CALIBRATED
+        mu_ffe, mu_dfe: Separate step sizes (no-AGC robust or calibrated mode)
         rms_floor, ema_beta: Causal normalization params (no-AGC robust mode)
+        calibration_stats: dict with 'ffe_rms_cal' [B, 1], required for CALIBRATED mode
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
@@ -378,9 +421,20 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
     all_ffe_weights = []
     ber_list = []
 
+    is_calibrated = (baseline_mode == BaselineMode.CALIBRATED)
+    if is_calibrated and calibration_stats is None:
+        raise ValueError(
+            "CALIBRATED mode requires calibration_stats with 'ffe_rms_cal' [B, 1] tensor"
+        )
+
     for i in range(batch_size):
         rx_i = rx_batch[i]
         tx_i = tx_batch[i]
+
+        cal_stats_i = None
+        if is_calibrated and calibration_stats is not None:
+            ffe_rms_i = calibration_stats["ffe_rms_cal"][i].item()
+            cal_stats_i = {"ffe_rms_cal": ffe_rms_i}
 
         mse_history, weights, w_main, mu_history, ber = run_nlms_dfe(
             rx_i, tx_i, num_taps=num_taps, mu=mu, eps=eps, teacher_forcing=teacher_forcing,
@@ -388,7 +442,7 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
             vss_alpha=vss_alpha, vss_gamma=vss_gamma, vss_momentum=vss_momentum,
             use_soft_decision=use_soft_decision, tau=tau,
             baseline_mode=baseline_mode, mu_ffe=mu_ffe, mu_dfe=mu_dfe,
-            rms_floor=rms_floor, ema_beta=ema_beta
+            rms_floor=rms_floor, ema_beta=ema_beta, calibration_stats=cal_stats_i
         )
         mse_histories.append(mse_history)
         mu_histories.append(mu_history)
@@ -412,7 +466,7 @@ def run_batch_nlms_dfe(rx_batch, tx_batch, num_taps, mu=0.1, eps=1e-6, teacher_f
 def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teacher_forcing=False,
                       use_soft_decision=True, tau=0.1, baseline_mode=BaselineMode.STANDARD,
                       diagonal_loading=RLS_DIAGONAL_LOADING, rms_floor=NLMS_RMS_FLOOR,
-                      mu_ffe=None, mu_dfe=None):
+                      mu_ffe=None, mu_dfe=None, calibration_stats=None):
     """
     Wrapper to run RLS DFE over a batch of channels.
 
@@ -425,24 +479,37 @@ def run_batch_rls_dfe(rx_batch, tx_batch, num_taps, lam=0.99, delta=0.01, teache
         final_weights: Final combined weights (FFE + DFE) from last channel [FFE_TAPS + num_taps]
 
     Parameters:
-        baseline_mode: STANDARD or NO_AGC_ROBUST
-        diagonal_loading: Added to P diagonal (no-AGC robust mode)
-        mu_ffe, mu_dfe: Separate step size scaling (no-AGC robust mode)
+        baseline_mode: STANDARD, NO_AGC_ROBUST, or CALIBRATED
+        diagonal_loading: Added to P diagonal
+        mu_ffe, mu_dfe: Separate step size scaling (no-AGC robust or calibrated mode)
+        calibration_stats: dict with 'ffe_rms_cal' [B, 1], required for CALIBRATED mode
     """
     batch_size = rx_batch.shape[0]
     mse_histories = []
     all_combined_weights = []
     ber_list = []
 
+    is_calibrated = (baseline_mode == BaselineMode.CALIBRATED)
+    if is_calibrated and calibration_stats is None:
+        raise ValueError(
+            "CALIBRATED mode requires calibration_stats with 'ffe_rms_cal' [B, 1] tensor"
+        )
+
     for i in range(batch_size):
         rx_i = rx_batch[i]
         tx_i = tx_batch[i]
+
+        cal_stats_i = None
+        if is_calibrated and calibration_stats is not None:
+            ffe_rms_i = calibration_stats["ffe_rms_cal"][i].item()
+            cal_stats_i = {"ffe_rms_cal": ffe_rms_i}
 
         mse_history, weights, ber = run_rls_dfe(
             rx_i, tx_i, num_taps=num_taps, lam=lam, delta=delta, teacher_forcing=teacher_forcing,
             use_soft_decision=use_soft_decision, tau=tau,
             baseline_mode=baseline_mode, diagonal_loading=diagonal_loading,
-            rms_floor=rms_floor, mu_ffe=mu_ffe, mu_dfe=mu_dfe
+            rms_floor=rms_floor, mu_ffe=mu_ffe, mu_dfe=mu_dfe,
+            calibration_stats=cal_stats_i
         )
         mse_histories.append(mse_history)
         all_combined_weights.append(weights.cpu().numpy())

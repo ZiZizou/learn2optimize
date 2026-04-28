@@ -104,10 +104,10 @@ class StreamingFeatureNormalizer(nn.Module):
         """Resume stats updates in training - syntactic sugar."""
         self.requires_grad_(training)
 
-    def state_dict(self):
+    def state_dict(self, **kwargs):
         """Override to ensure normalizer buffers are saved in checkpoint."""
         return {k: v.clone() if isinstance(v, torch.Tensor) else v
-                for k, v in super().state_dict().items()}
+                for k, v in super().state_dict(**kwargs).items()}
 
     def load_state_dict(self, state_dict):
         """Override to handle buffer restoration."""

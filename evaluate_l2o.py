@@ -27,6 +27,42 @@ from benchmark_nlms import BaselineMode, run_batch_nlms_dfe, run_batch_rls_dfe
 from l2o_basic import DifferentiableCTLE, DifferentiableDFE, MultiRateLearnedNLMS
 from ctle_frequency_utils import apply_frequency_domain_ctle
 
+
+def compute_calibration_stats(
+    rx_aligned: torch.Tensor,
+    ffe_taps: int,
+    eps: float = 1e-6,
+) -> dict[str, torch.Tensor]:
+    """
+    Compute per-example non-causal calibration stats from full aligned waveform.
+
+    Calibration uses FFE regressor windows (not raw RX RMS) to match the actual
+    equalizer domain. For PAM-2 symbols, TX RMS is constant and not informative,
+    so calibration comes entirely from receive-side regressor statistics.
+
+    Args:
+        rx_aligned: [batch_size, seq_len] aligned receive waveform
+        ffe_taps: Number of FFE taps (window size)
+        eps: Small floor for numerical stability
+
+    Returns:
+        dict with:
+            - 'ffe_rms_cal': [batch_size, 1] tensor with RMS of FFE windows per example
+    """
+    batch_size, seq_len = rx_aligned.shape
+    if seq_len < ffe_taps:
+        raise ValueError(
+            f"Sequence length {seq_len} too short for FFE taps {ffe_taps}. "
+            "Need seq_len >= ffe_taps for calibration."
+        )
+
+    windows = rx_aligned.unfold(1, ffe_taps, 1)
+    ffe_rms_cal = torch.sqrt(
+        windows.pow(2).mean(dim=(1, 2)) + eps
+    ).unsqueeze(1)
+
+    return {"ffe_rms_cal": ffe_rms_cal}
+
 def run_l2o_inference(model, model_type, rx_base, tx_symbols, ctle, dfe, ctle_peaking=0.5, ablate_ctle=False):
     """
     Evaluates a trained L2O model on a pre-generated batch of channels without weight updates.
@@ -390,6 +426,15 @@ if __name__ == "__main__":
           f"ambiguous={sync_stats['ambiguous_frac']:.1%}")
     print("-" * 60)
 
+    is_calibrated = (baseline_mode == BaselineMode.CALIBRATED)
+    if is_calibrated:
+        print("[CALIBRATED] Computing non-causal calibration stats from aligned waveform...")
+        calibration_stats = compute_calibration_stats(rx_aligned, FFE_TAPS)
+        print(f"[CALIBRATED] ffe_rms_cal range: [{calibration_stats['ffe_rms_cal'].min().item():.4f}, "
+              f"{calibration_stats['ffe_rms_cal'].max().item():.4f}]")
+    else:
+        calibration_stats = None
+
     results = {}
     # Store weights per channel per method: weights[method][channel_idx] = (ffe_taps, dfe_taps)
     all_ffe_weights = {}  # method -> list of FFE arrays
@@ -491,13 +536,15 @@ if __name__ == "__main__":
 
     # 2. Run Benchmarks on the SAME batch data (fair comparison)
 
+    calibrated_suffix = " (Upper Bound)" if is_calibrated else ""
     # Static NLMS Bench (if enabled)
     if include_nlms:
         avg_mse_nlms, nlms_all_dfe, nlms_all_ffe, mu_nlms, ber_nlms = run_batch_nlms_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.05, teacher_forcing=False,
-            baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
+            baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE,
+            calibration_stats=calibration_stats
         )
-        nlms_label = f"NLMS (0.05) [{baseline_mode.value}]"
+        nlms_label = f"NLMS (0.05) [{baseline_mode.value}]{calibrated_suffix}"
         results[nlms_label] = (torch.mean(avg_mse_nlms).item(), torch.mean(avg_mse_nlms[burn_in:]).item(), ber_nlms)
         all_ffe_weights[nlms_label] = nlms_all_ffe
         all_dfe_weights[nlms_label] = nlms_all_dfe
@@ -512,14 +559,15 @@ if __name__ == "__main__":
         for idx, vss_mu_max_val in enumerate(vss_mu_max_values):
             style = line_styles[idx % len(line_styles)]
             color = colors[idx % len(colors)]
-            label_vss = f"NLMS VSS (μ_max={vss_mu_max_val}) [{baseline_mode.value}]"
-            label_vss_mom = f"NLMS VSS (μ_max={vss_mu_max_val}, Mom={VSS_MOMENTUM}) [{baseline_mode.value}]"
+            label_vss = f"NLMS VSS (μ_max={vss_mu_max_val}) [{baseline_mode.value}]{calibrated_suffix}"
+            label_vss_mom = f"NLMS VSS (μ_max={vss_mu_max_val}, Mom={VSS_MOMENTUM}) [{baseline_mode.value}]{calibrated_suffix}"
 
             avg_mse_vss, vss_all_dfe, vss_all_ffe, mu_vss, ber_vss = run_batch_nlms_dfe(
                 rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
                 use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
                 vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA,
-                baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
+                baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE,
+                calibration_stats=calibration_stats
             )
             results[label_vss] = (torch.mean(avg_mse_vss).item(), torch.mean(avg_mse_vss[burn_in:]).item(), ber_vss)
             all_ffe_weights[label_vss] = vss_all_ffe
@@ -533,7 +581,8 @@ if __name__ == "__main__":
                     rx_aligned, tx_aligned, num_taps=DFE_TAPS, mu=0.1, teacher_forcing=False,
                     use_vss=True, vss_mu_max=vss_mu_max_val, vss_mu_min=VSS_MU_MIN,
                     vss_alpha=VSS_ALPHA, vss_gamma=VSS_GAMMA, vss_momentum=VSS_MOMENTUM,
-                    baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
+                    baseline_mode=baseline_mode, mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE,
+                    calibration_stats=calibration_stats
                 )
                 results[label_vss_mom] = (torch.mean(avg_mse_vss_mom).item(), torch.mean(avg_mse_vss_mom[burn_in:]).item(), ber_vss_mom)
                 all_ffe_weights[label_vss_mom] = vss_mom_all_ffe
@@ -550,9 +599,10 @@ if __name__ == "__main__":
         avg_mse_rls, rls_all_combined, ber_rls = run_batch_rls_dfe(
             rx_aligned, tx_aligned, num_taps=DFE_TAPS, lam=RLS_LAMBDA, delta=dynamic_delta, teacher_forcing=False,
             baseline_mode=baseline_mode, diagonal_loading=RLS_DIAGONAL_LOADING,
-            mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE
+            mu_ffe=NLMS_MU_FFE, mu_dfe=NLMS_MU_DFE,
+            calibration_stats=calibration_stats
         )
-        rls_label = f"RLS [{baseline_mode.value}]"
+        rls_label = f"RLS [{baseline_mode.value}]{calibrated_suffix}"
         results[rls_label] = (torch.mean(avg_mse_rls).item(), torch.mean(avg_mse_rls[burn_in:]).item(), ber_rls)
         all_ffe_weights[rls_label] = [w[:FFE_TAPS] for w in rls_all_combined]
         all_dfe_weights[rls_label] = [w[FFE_TAPS:] for w in rls_all_combined]
